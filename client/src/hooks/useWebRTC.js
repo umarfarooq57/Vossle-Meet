@@ -17,12 +17,14 @@ const useWebRTC = (roomId) => {
     const [remotePeer, setRemotePeer] = useState(null);
     const [qualityMetrics, setQualityMetrics] = useState(null);
 
-    const peerConnection = useRef(null);
+    // Support multiple peer connections (one per remote socket id)
+    const peerConnections = useRef(new Map()); // socketId -> RTCPeerConnection
     const localVideoRef = useRef(null);
     const remoteVideoRef = useRef(null);
     const screenStream = useRef(null);
     const originalVideoTrack = useRef(null);
     const metricsInterval = useRef(null);
+    const lastRemotePeer = useRef(null);
 
     /**
      * Initialize local media stream
@@ -61,7 +63,7 @@ const useWebRTC = (roomId) => {
     /**
      * Create and configure peer connection
      */
-    const createPeerConnection = useCallback(async (stream) => {
+    const createPeerConnection = useCallback(async (stream, remoteSocketId) => {
         try {
             // Fetch ICE servers from backend
             let iceConfig;
@@ -84,15 +86,19 @@ const useWebRTC = (roomId) => {
             });
 
             // Add local tracks to connection
-            stream.getTracks().forEach((track) => {
-                pc.addTrack(track, stream);
-            });
+            if (stream) {
+                stream.getTracks().forEach((track) => {
+                    pc.addTrack(track, stream);
+                });
+            }
 
             // Handle remote tracks
             pc.ontrack = (event) => {
-                console.log('[Vossle WebRTC] Remote track received:', event.track.kind);
+                console.log('[Vossle WebRTC] Remote track received from', remoteSocketId, event.track.kind);
                 const [remoteStreamObj] = event.streams;
+                // remember last remote stream for main view
                 setRemoteStream(remoteStreamObj);
+                lastRemotePeer.current = remoteSocketId;
                 if (remoteVideoRef.current) {
                     remoteVideoRef.current.srcObject = remoteStreamObj;
                 }
@@ -103,7 +109,7 @@ const useWebRTC = (roomId) => {
                 if (event.candidate) {
                     socketService.emit('webrtc:ice-candidate', {
                         candidate: event.candidate,
-                        targetSocketId: remotePeerRef.current,
+                        targetSocketId: remoteSocketId,
                     });
                 }
             };
@@ -121,7 +127,8 @@ const useWebRTC = (roomId) => {
                 }
             };
 
-            peerConnection.current = pc;
+            // store connection for this remote
+            if (remoteSocketId) peerConnections.current.set(remoteSocketId, pc);
             return pc;
         } catch (error) {
             console.error('[Vossle WebRTC] Peer connection error:', error);
@@ -135,8 +142,11 @@ const useWebRTC = (roomId) => {
      * Start call — create offer and send via signaling
      */
     const startCall = useCallback(async (targetSocketId) => {
-        const pc = peerConnection.current;
-        if (!pc) return;
+        // create or reuse peer connection for target
+        let pc = peerConnections.current.get(targetSocketId);
+        if (!pc) {
+            pc = await createPeerConnection(localStream, targetSocketId);
+        }
 
         remotePeerRef.current = targetSocketId;
 
@@ -150,14 +160,17 @@ const useWebRTC = (roomId) => {
             offer: pc.localDescription,
             targetSocketId,
         });
-    }, []);
+    }, [createPeerConnection, localStream]);
 
     /**
      * Handle incoming offer — create answer
      */
     const handleOffer = useCallback(async (offer, senderSocketId) => {
-        const pc = peerConnection.current;
-        if (!pc) return;
+        // ensure peer connection for sender
+        let pc = peerConnections.current.get(senderSocketId);
+        if (!pc) {
+            pc = await createPeerConnection(localStream, senderSocketId);
+        }
 
         remotePeerRef.current = senderSocketId;
 
@@ -169,13 +182,13 @@ const useWebRTC = (roomId) => {
             answer: pc.localDescription,
             targetSocketId: senderSocketId,
         });
-    }, []);
+    }, [createPeerConnection, localStream]);
 
     /**
      * Handle incoming answer
      */
-    const handleAnswer = useCallback(async (answer) => {
-        const pc = peerConnection.current;
+    const handleAnswer = useCallback(async (answer, senderSocketId) => {
+        const pc = peerConnections.current.get(senderSocketId);
         if (!pc) return;
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
     }, []);
@@ -183,8 +196,8 @@ const useWebRTC = (roomId) => {
     /**
      * Handle incoming ICE candidate
      */
-    const handleIceCandidate = useCallback(async (candidate) => {
-        const pc = peerConnection.current;
+    const handleIceCandidate = useCallback(async (candidate, senderSocketId) => {
+        const pc = peerConnections.current.get(senderSocketId);
         if (!pc) return;
         try {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -225,8 +238,8 @@ const useWebRTC = (roomId) => {
      * Toggle screen sharing
      */
     const toggleScreenShare = useCallback(async () => {
-        const pc = peerConnection.current;
-        if (!pc) return;
+        // For multi-peer: replace track on all peer connections
+        const pcs = Array.from(peerConnections.current.values());
 
         if (isScreenSharing) {
             // Stop screen sharing — restore camera
@@ -235,9 +248,11 @@ const useWebRTC = (roomId) => {
                 screenStream.current = null;
             }
             if (originalVideoTrack.current) {
-                const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-                if (sender) {
-                    await sender.replaceTrack(originalVideoTrack.current);
+                for (const p of pcs) {
+                    const sender = p.getSenders().find((s) => s.track?.kind === 'video');
+                    if (sender) {
+                        await sender.replaceTrack(originalVideoTrack.current);
+                    }
                 }
             }
             setIsScreenSharing(false);
@@ -252,10 +267,15 @@ const useWebRTC = (roomId) => {
                 screenStream.current = display;
 
                 const screenVideoTrack = display.getVideoTracks()[0];
-                const sender = pc.getSenders().find((s) => s.track?.kind === 'video');
-                if (sender) {
-                    originalVideoTrack.current = sender.track;
-                    await sender.replaceTrack(screenVideoTrack);
+                // Replace sender track on every peer connection
+                for (const p of pcs) {
+                    const sender = p.getSenders().find((s) => s.track?.kind === 'video');
+                    if (sender && !originalVideoTrack.current) {
+                        originalVideoTrack.current = sender.track;
+                    }
+                    if (sender) {
+                        await sender.replaceTrack(screenVideoTrack);
+                    }
                 }
 
                 // Auto-stop when user clicks "Stop sharing" in browser UI

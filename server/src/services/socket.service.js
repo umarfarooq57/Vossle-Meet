@@ -73,61 +73,111 @@ const initializeSocket = (httpServer) => {
         });
 
         // ── Join Room ──
-        socket.on('room:join', ({ roomId, sessionId }) => {
-            try {
-                // Leave any existing room first
-                leaveCurrentRoom(socket, io);
+        // Helper: actually add a user into the room
+        function addUserToRoom(targetSocket) {
+            const roomId = targetSocket._pendingRoomId || connectedUsers.get(targetSocket.id)?.roomId;
+            if (!roomId) return;
 
-                // Join the new room
-                socket.join(roomId);
+            targetSocket.join(roomId);
 
-                const userInfo = connectedUsers.get(socket.id);
-                if (userInfo) {
-                    userInfo.roomId = roomId;
-                }
+            const userInfo = connectedUsers.get(targetSocket.id);
+            if (userInfo) {
+                userInfo.roomId = roomId;
+            }
 
-                // Track room membership
-                if (!rooms.has(roomId)) {
-                    rooms.set(roomId, new Set());
-                }
-                rooms.get(roomId).add(socket.id);
+            if (!rooms.has(roomId)) {
+                rooms.set(roomId, new Set());
+            }
+            rooms.get(roomId).add(targetSocket.id);
 
-                const roomMembers = rooms.get(roomId);
-                const memberCount = roomMembers.size;
+            const roomMembers = rooms.get(roomId);
+            const memberCount = roomMembers.size;
 
-                console.log(`[Vossle] ${socket.userName} joined room ${roomId} (${memberCount} users)`);
+            console.log(`[Vossle] ${targetSocket.userName} joined room ${roomId} (${memberCount} users)`);
 
-                // Notify the joiner of existing users
-                const existingUsers = [];
-                for (const memberId of roomMembers) {
-                    if (memberId !== socket.id) {
-                        const member = connectedUsers.get(memberId);
-                        if (member) {
-                            existingUsers.push({
-                                socketId: memberId,
-                                userId: member.userId,
-                                userName: member.userName,
-                            });
-                        }
+            const existingUsers = [];
+            for (const memberId of roomMembers) {
+                if (memberId !== targetSocket.id) {
+                    const member = connectedUsers.get(memberId);
+                    if (member) {
+                        existingUsers.push({
+                            socketId: memberId,
+                            userId: member.userId,
+                            userName: member.userName,
+                        });
                     }
                 }
+            }
 
-                socket.emit('room:joined', {
-                    roomId,
-                    existingUsers,
-                    memberCount,
-                });
+            targetSocket.emit('room:joined', {
+                roomId,
+                existingUsers,
+                memberCount,
+            });
 
-                // Notify others in the room
-                socket.to(roomId).emit('room:user-joined', {
-                    socketId: socket.id,
-                    userId: socket.userId,
-                    userName: socket.userName,
-                    memberCount,
-                });
+            targetSocket.to(roomId).emit('room:user-joined', {
+                socketId: targetSocket.id,
+                userId: targetSocket.userId,
+                userName: targetSocket.userName,
+                memberCount,
+            });
 
+            delete targetSocket._pendingRoomId;
+        }
+
+        // ── Join Room (with admission control) ──
+        socket.on('room:join', ({ roomId, sessionId }) => {
+            try {
+                leaveCurrentRoom(socket, io);
+
+                // Check if room already has members (host is in)
+                const roomMembers = rooms.get(roomId);
+                if (roomMembers && roomMembers.size > 0) {
+                    // Room has a host — send join request instead of direct join
+                    socket._pendingRoomId = roomId;
+                    console.log(`[Vossle] ${socket.userName} requesting to join room ${roomId}`);
+
+                    // Send join request to all existing room members (host)
+                    for (const memberId of roomMembers) {
+                        io.to(memberId).emit('room:join-request', {
+                            requestSocketId: socket.id,
+                            userId: socket.userId,
+                            userName: socket.userName,
+                            roomId,
+                        });
+                    }
+
+                    // Notify the requester they're waiting
+                    socket.emit('room:waiting-admission', { roomId });
+                } else {
+                    // First person (host) — join directly
+                    socket._pendingRoomId = roomId;
+                    addUserToRoom(socket);
+                }
             } catch (error) {
                 socket.emit('error', { message: 'Failed to join room.' });
+            }
+        });
+
+        // ── Host accepts join request ──
+        socket.on('room:admit', ({ requestSocketId, roomId }) => {
+            const requesterSocket = io.sockets.sockets.get(requestSocketId);
+            if (!requesterSocket) {
+                socket.emit('error', { message: 'User already disconnected.' });
+                return;
+            }
+            console.log(`[Vossle] ${socket.userName} admitted ${requesterSocket.userName} to room ${roomId}`);
+            requesterSocket._pendingRoomId = roomId;
+            addUserToRoom(requesterSocket);
+            requesterSocket.emit('room:admitted', { roomId });
+        });
+
+        // ── Host rejects join request ──
+        socket.on('room:reject', ({ requestSocketId, roomId }) => {
+            const requesterSocket = io.sockets.sockets.get(requestSocketId);
+            if (requesterSocket) {
+                console.log(`[Vossle] ${socket.userName} rejected ${requesterSocket.userName} from room ${roomId}`);
+                requesterSocket.emit('room:rejected', { roomId, reason: 'The host denied your request to join.' });
             }
         });
 

@@ -43,6 +43,11 @@ const Room = () => {
     const [lobbyAudioEnabled, setLobbyAudioEnabled] = useState(true);
     const [lobbyVideoEnabled, setLobbyVideoEnabled] = useState(true);
 
+    // Admission control
+    const [joinRequests, setJoinRequests] = useState([]); // host sees these
+    const [waitingForAdmission, setWaitingForAdmission] = useState(false); // joiner sees this
+    const [admissionDenied, setAdmissionDenied] = useState(false);
+
     const {
         localStream,
         remoteStream,
@@ -212,12 +217,12 @@ const Room = () => {
             await handleOffer(offer, senderSocketId);
         });
 
-        socket.on('webrtc:answer', async ({ answer }) => {
-            await handleAnswer(answer);
+        socket.on('webrtc:answer', async ({ answer, senderSocketId }) => {
+            await handleAnswer(answer, senderSocketId);
         });
 
-        socket.on('webrtc:ice-candidate', async ({ candidate }) => {
-            await handleIceCandidate(candidate);
+        socket.on('webrtc:ice-candidate', async ({ candidate, senderSocketId }) => {
+            await handleIceCandidate(candidate, senderSocketId);
         });
 
         socket.on('room:user-left', ({ userName, socketId }) => {
@@ -239,6 +244,33 @@ const Room = () => {
             if (!chatOpenRef.current) setHasUnread(true);
         });
 
+        // ── Admission control ──
+        // Host receives join requests
+        socket.on('room:join-request', ({ requestSocketId, userName, userId }) => {
+            setJoinRequests(prev => {
+                // Avoid duplicates
+                if (prev.some(r => r.requestSocketId === requestSocketId)) return prev;
+                return [...prev, { requestSocketId, userName, userId }];
+            });
+        });
+
+        // Joiner: waiting for host
+        socket.on('room:waiting-admission', () => {
+            setWaitingForAdmission(true);
+        });
+
+        // Joiner: host admitted you
+        socket.on('room:admitted', () => {
+            setWaitingForAdmission(false);
+        });
+
+        // Joiner: host rejected you
+        socket.on('room:rejected', ({ reason }) => {
+            setWaitingForAdmission(false);
+            setAdmissionDenied(true);
+            setError(reason || 'The host denied your request to join.');
+        });
+
     }, [startCall, handleOffer, handleAnswer, handleIceCandidate]);
 
     // ── Connection state tracking ──
@@ -249,6 +281,17 @@ const Room = () => {
             if (status === 'connected') setStatus('ended');
         }
     }, [connectionState, status]);
+
+    // ── Admission control actions ──
+    const handleAdmit = (requestSocketId) => {
+        socketService.emit('room:admit', { requestSocketId, roomId: sessionId });
+        setJoinRequests(prev => prev.filter(r => r.requestSocketId !== requestSocketId));
+    };
+
+    const handleReject = (requestSocketId) => {
+        socketService.emit('room:reject', { requestSocketId, roomId: sessionId });
+        setJoinRequests(prev => prev.filter(r => r.requestSocketId !== requestSocketId));
+    };
 
     // ── Actions ──
     const handleEndCall = async () => {
@@ -457,6 +500,52 @@ const Room = () => {
         );
     }
 
+    // ── WAITING FOR HOST ADMISSION ──
+    if (waitingForAdmission) {
+        return (
+            <div style={s.fullCenter}>
+                <div style={{ textAlign: 'center', maxWidth: 400 }}>
+                    <img src="/vossle-logo.svg" alt="Vossle" style={{ width: 48, height: 48, marginBottom: 16 }} />
+                    <h2 style={{ color: '#fff', fontSize: '1.3rem', marginBottom: 8 }}>Waiting for the host to let you in</h2>
+                    <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: '0.9rem', marginBottom: 24 }}>
+                        The host has been notified of your request to join.
+                    </p>
+                    <div style={{ display: 'flex', justifyContent: 'center', gap: 8 }}>
+                        <div style={s.pulsingDot} /><div style={{ ...s.pulsingDot, animationDelay: '0.2s' }} /><div style={{ ...s.pulsingDot, animationDelay: '0.4s' }} />
+                    </div>
+                    <button
+                        onClick={() => { setWaitingForAdmission(false); navigate('/dashboard'); }}
+                        style={{ marginTop: 32, background: 'none', border: '1px solid rgba(255,255,255,0.15)', color: 'rgba(255,255,255,0.6)', padding: '10px 24px', borderRadius: 8, cursor: 'pointer', fontSize: '0.85rem' }}
+                    >
+                        Cancel &amp; Go Back
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    // ── ADMISSION DENIED ──
+    if (admissionDenied) {
+        return (
+            <div style={s.fullCenter}>
+                <div style={{ textAlign: 'center', maxWidth: 400 }}>
+                    <div style={{ fontSize: '2.5rem', marginBottom: 16 }}>🚫</div>
+                    <h2 style={{ color: '#ef4444', fontSize: '1.3rem', marginBottom: 8 }}>Request Denied</h2>
+                    <p style={{ color: 'rgba(255,255,255,0.5)', fontSize: '0.9rem', marginBottom: 24 }}>
+                        {error || 'The host denied your request to join this meeting.'}
+                    </p>
+                    <button
+                        onClick={() => navigate('/dashboard')}
+                        className="btn btn-primary"
+                        style={{ padding: '12px 28px' }}
+                    >
+                        Back to Dashboard
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
     // ── ACTIVE CALL ──
     return (
         <div style={s.roomContainer}>
@@ -468,6 +557,37 @@ const Room = () => {
                     </div>
                 ))}
             </div>
+
+            {/* Join Request Notifications (Host sees these) */}
+            {joinRequests.length > 0 && (
+                <div style={s.joinRequestOverlay}>
+                    {joinRequests.map((req) => (
+                        <div key={req.requestSocketId} style={s.joinRequestCard}>
+                            <div style={s.joinRequestAvatar}>
+                                {req.userName?.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2) || '?'}
+                            </div>
+                            <div style={s.joinRequestInfo}>
+                                <span style={s.joinRequestName}>{req.userName}</span>
+                                <span style={s.joinRequestLabel}>wants to join this meeting</span>
+                            </div>
+                            <div style={s.joinRequestActions}>
+                                <button
+                                    onClick={() => handleAdmit(req.requestSocketId)}
+                                    style={s.admitBtn}
+                                >
+                                    Admit
+                                </button>
+                                <button
+                                    onClick={() => handleReject(req.requestSocketId)}
+                                    style={s.rejectBtn}
+                                >
+                                    Deny
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
 
             {/* Top Bar */}
             <div style={s.topBar}>
@@ -791,6 +911,15 @@ const s = {
         fontFamily: "'Inter', sans-serif",
     },
 
+    // Waiting animation dots
+    pulsingDot: {
+        width: 8,
+        height: 8,
+        borderRadius: '50%',
+        background: '#6366f1',
+        animation: 'vossle-pulse 1s infinite ease-in-out',
+    },
+
     /* ── Active call ── */
     roomContainer: {
         height: '100vh',
@@ -858,6 +987,78 @@ const s = {
         fontSize: '0.7rem',
         fontFamily: "'JetBrains Mono', monospace",
         color: '#9191a8',
+    },
+    joinRequestOverlay: {
+        position: 'fixed',
+        top: 72,
+        right: 16,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px',
+        zIndex: 30,
+    },
+    joinRequestCard: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '10px',
+        padding: '10px 12px',
+        background: 'rgba(15, 15, 25, 0.96)',
+        borderRadius: '12px',
+        border: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: '0 18px 45px rgba(0,0,0,0.55)',
+        minWidth: '260px',
+    },
+    joinRequestAvatar: {
+        width: 32,
+        height: 32,
+        borderRadius: '50%',
+        background: 'linear-gradient(135deg, #6366f1, #22d3ee)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: '0.9rem',
+        fontWeight: 600,
+        color: '#f9fafb',
+    },
+    joinRequestInfo: {
+        flex: 1,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+    },
+    joinRequestName: {
+        fontSize: '0.85rem',
+        fontWeight: 600,
+        color: '#e5e7eb',
+    },
+    joinRequestLabel: {
+        fontSize: '0.75rem',
+        color: '#9ca3af',
+    },
+    joinRequestActions: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+    },
+    admitBtn: {
+        padding: '6px 10px',
+        borderRadius: 999,
+        border: 'none',
+        background: '#22c55e',
+        color: '#022c22',
+        fontSize: '0.75rem',
+        fontWeight: 600,
+        cursor: 'pointer',
+    },
+    rejectBtn: {
+        padding: '6px 10px',
+        borderRadius: 999,
+        border: '1px solid rgba(248,113,113,0.5)',
+        background: 'transparent',
+        color: '#fecaca',
+        fontSize: '0.75rem',
+        fontWeight: 500,
+        cursor: 'pointer',
     },
     mainArea: {
         flex: 1,
