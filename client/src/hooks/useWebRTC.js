@@ -106,6 +106,7 @@ const useWebRTC = (roomId) => {
 
             // ICE candidate handling — trickle ICE
             pc.onicecandidate = (event) => {
+                console.log('[Vossle WebRTC] onicecandidate for', remoteSocketId, event.candidate ? 'candidate' : 'null');
                 if (event.candidate) {
                     socketService.emit('webrtc:ice-candidate', {
                         candidate: event.candidate,
@@ -117,13 +118,13 @@ const useWebRTC = (roomId) => {
             // Connection state tracking
             pc.onconnectionstatechange = () => {
                 setConnectionState(pc.connectionState);
-                console.log('[Vossle WebRTC] Connection state:', pc.connectionState);
+                console.log('[Vossle WebRTC] Connection state for', remoteSocketId, pc.connectionState);
             };
 
             pc.oniceconnectionstatechange = () => {
-                console.log('[Vossle WebRTC] ICE state:', pc.iceConnectionState);
+                console.log('[Vossle WebRTC] ICE state for', remoteSocketId, pc.iceConnectionState);
                 if (pc.iceConnectionState === 'failed') {
-                    pc.restartIce();
+                    try { pc.restartIce(); } catch (e) { console.warn('restartIce failed', e); }
                 }
             };
 
