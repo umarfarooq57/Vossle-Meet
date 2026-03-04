@@ -59,7 +59,7 @@ const Room = () => {
         localVideoRef,
         remoteVideoRef,
         initializeMedia,
-        startCall,
+        createPeerConnection, // Replaced startCall
         handleOffer,
         handleAnswer,
         handleIceCandidate,
@@ -180,37 +180,50 @@ const Room = () => {
         const socket = socketService.getSocket();
         if (!socket) return;
 
-        socket.on('room:joined', ({ existingUsers }) => {
+        socket.on('room:joined', async ({ existingUsers }) => {
             if (existingUsers?.length > 0) {
                 const peer = existingUsers[0];
                 setRemoteUserName(peer.userName);
                 setStatus('connecting');
-                startCall(peer.socketId);
-                setParticipants(prev => [...prev, {
-                    id: peer.socketId,
-                    name: peer.userName,
-                    isAudioEnabled: true,
-                    isVideoEnabled: true,
-                }]);
+
+                // Newcomer is POLITE (waits for offer)
+                await createPeerConnection(peer.socketId, true);
+
+                setParticipants(prev => {
+                    const others = prev.filter(p => p.id !== peer.socketId);
+                    return [...others, {
+                        id: peer.socketId,
+                        name: peer.userName,
+                        isAudioEnabled: true,
+                        isVideoEnabled: true,
+                    }];
+                });
             }
         });
 
-        socket.on('room:user-joined', ({ socketId, userName }) => {
+        socket.on('room:user-joined', async ({ socketId, userName }) => {
             setRemoteUserName(userName);
             setStatus('connecting');
-            startCall(socketId);
-            setParticipants(prev => [...prev, {
-                id: socketId,
-                name: userName,
-                isAudioEnabled: true,
-                isVideoEnabled: true,
-            }]);
+
+            // Existing user is IMPOLITE (sends offer)
+            await createPeerConnection(socketId, false);
+
+            setParticipants(prev => {
+                const others = prev.filter(p => p.id !== socketId);
+                return [...others, {
+                    id: socketId,
+                    name: userName,
+                    isAudioEnabled: true,
+                    isVideoEnabled: true,
+                }];
+            });
         });
 
         socket.on('webrtc:offer', async ({ offer, senderSocketId, senderName }) => {
             setRemoteUserName(senderName);
-            setStatus('connecting');
-            await handleOffer(offer, senderSocketId);
+            // Politeness depends on role: newcomer is polite
+            const isPolite = participants.length > 1;
+            await handleOffer(offer, senderSocketId, isPolite);
         });
 
         socket.on('webrtc:answer', async ({ answer, senderSocketId }) => {
@@ -233,6 +246,14 @@ const Room = () => {
 
         socket.on('media:audio-toggled', ({ enabled, socketId }) => {
             setParticipants(prev => prev.map(p => p.id === socketId ? { ...p, isAudioEnabled: enabled } : p));
+        });
+
+        socket.on('media:screen-share-changed', ({ sharing, socketId }) => {
+            setParticipants(prev => prev.map(p => p.id === socketId ? { ...p, isScreenSharing: sharing } : p));
+        });
+
+        socket.on('media:hand-raised', ({ raised, socketId }) => {
+            setParticipants(prev => prev.map(p => p.id === socketId ? { ...p, isHandRaised: raised } : p));
         });
 
         socket.on('chat:message', (message) => {
