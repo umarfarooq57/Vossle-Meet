@@ -20,7 +20,7 @@ const register = async (req, res) => {
         const { name, email, password } = req.body;
 
         // Check if user already exists
-        const existing = UserStore.findByEmail(email);
+        const existing = await UserStore.findByEmail(email);
         if (existing) {
             return res.status(409).json({ error: 'Email already registered.' });
         }
@@ -30,7 +30,7 @@ const register = async (req, res) => {
         const passwordHash = await bcrypt.hash(password, salt);
 
         // Create user
-        const user = UserStore.create({ name, email, passwordHash });
+        const user = await UserStore.create({ name, email, passwordHash });
 
         // Generate tokens
         const accessToken = generateAccessToken(user);
@@ -57,7 +57,7 @@ const login = async (req, res) => {
         const { email, password } = req.body;
 
         // Find user
-        const user = UserStore.findByEmail(email);
+        const user = await UserStore.findByEmail(email);
         if (!user) {
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
@@ -69,7 +69,7 @@ const login = async (req, res) => {
         }
 
         // Update last login
-        UserStore.updateLastLogin(user.id);
+        await UserStore.updateLastLogin(user.id);
 
         // Generate tokens
         const sanitizedUser = UserStore.sanitize(user);
@@ -91,7 +91,7 @@ const login = async (req, res) => {
 /**
  * POST /api/auth/refresh
  */
-const refresh = (req, res) => {
+const refresh = async (req, res) => {
     const token = req.cookies?.refreshToken;
 
     if (!token) {
@@ -103,7 +103,7 @@ const refresh = (req, res) => {
         return res.status(401).json({ error: 'Invalid refresh token.' });
     }
 
-    const user = UserStore.findById(decoded.id);
+    const user = await UserStore.findById(decoded.id);
     if (!user) {
         return res.status(401).json({ error: 'User not found.' });
     }

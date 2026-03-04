@@ -1,0 +1,50 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+}
+
+model User {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  email         String    @unique
+  name          String
+  passwordHash  String
+  avatar        String?
+  role          String    @default("user")
+  createdAt     DateTime  @default(now())
+  lastLoginAt   DateTime?
+  
+  // Relations
+  hostSessions      Session[] @relation("HostSessions")
+  participantSessions Session[] @relation("ParticipantSessions")
+}
+
+model Session {
+  id                String    @id @default(auto()) @map("_id") @db.ObjectId
+  roomCode          String    @unique
+  title             String    @default("Vossle Meeting")
+  
+  // Host Relation
+  hostId            String    @db.ObjectId
+  host              User      @relation("HostSessions", fields: [hostId], references: [id])
+  hostName          String
+  
+  // Participant Relation
+  participantId     String?   @db.ObjectId
+  participant       User?     @relation("ParticipantSessions", fields: [participantId], references: [id])
+  participantName   String?
+  
+  status            String    @default("created") // created, waiting, active, ended, archived
+  createdAt         DateTime  @default(now())
+  startedAt         DateTime?
+  endedAt           DateTime?
+  duration          Int?
+  
+  hostJoinedAt      DateTime?
+  participantJoinedAt DateTime?
+}

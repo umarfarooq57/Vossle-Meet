@@ -1,59 +1,54 @@
 /**
- * Vossle — In-Memory User Store
- * 
- * Production: Replace with PostgreSQL/MongoDB via an ORM (Prisma/Sequelize).
- * This in-memory store is for MVP rapid development.
+ * Vossle — User Store (Prisma/MongoDB)
  */
 
-const { v4: uuidv4 } = require('uuid');
-
-const users = new Map();
+const prisma = require('../config/prisma.client');
 
 const UserStore = {
     /**
      * Create a new user
      */
-    create({ name, email, passwordHash }) {
-        const id = uuidv4();
-        const user = {
-            id,
-            name,
-            email: email.toLowerCase(),
-            passwordHash,
-            avatar: null,
-            role: 'user',
-            createdAt: new Date().toISOString(),
-            lastLoginAt: null,
-        };
-        users.set(id, user);
+    async create({ name, email, passwordHash }) {
+        const user = await prisma.user.create({
+            data: {
+                name,
+                email: email.toLowerCase(),
+                passwordHash,
+                role: 'user',
+            },
+        });
         return this.sanitize(user);
     },
 
     /**
      * Find user by email
      */
-    findByEmail(email) {
-        for (const user of users.values()) {
-            if (user.email === email.toLowerCase()) return user;
-        }
-        return null;
+    async findByEmail(email) {
+        return prisma.user.findUnique({
+            where: { email: email.toLowerCase() },
+        });
     },
 
     /**
      * Find user by ID
      */
-    findById(id) {
-        return users.get(id) || null;
+    async findById(id) {
+        return prisma.user.findUnique({
+            where: { id },
+        });
     },
 
     /**
      * Update last login timestamp
      */
-    updateLastLogin(id) {
-        const user = users.get(id);
-        if (user) {
-            user.lastLoginAt = new Date().toISOString();
-            users.set(id, user);
+    async updateLastLogin(id) {
+        try {
+            await prisma.user.update({
+                where: { id },
+                data: { lastLoginAt: new Date() },
+            });
+        } catch (error) {
+            console.error('[UserStore] Error updating last login:', error.message);
         }
     },
 
@@ -69,8 +64,8 @@ const UserStore = {
     /**
      * Get total user count
      */
-    count() {
-        return users.size;
+    async count() {
+        return prisma.user.count();
     },
 };
 

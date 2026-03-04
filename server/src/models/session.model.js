@@ -1,13 +1,8 @@
 /**
- * Vossle — In-Memory Session Store
- * 
- * Manages video call session lifecycle:
- * CREATED → WAITING → ACTIVE → ENDED → ARCHIVED
+ * Vossle — Session Store (Prisma/MongoDB)
  */
 
-const { v4: uuidv4 } = require('uuid');
-
-const sessions = new Map();
+const prisma = require('../config/prisma.client');
 
 const SessionStatus = {
     CREATED: 'created',
@@ -21,108 +16,103 @@ const SessionStore = {
     /**
      * Create a new video session (room)
      */
-    create({ hostId, hostName, title }) {
-        const id = uuidv4();
+    async create({ hostId, hostName, title }) {
         const roomCode = this.generateRoomCode();
-        const session = {
-            id,
-            roomCode,
-            title: title || 'Vossle Meeting',
-            hostId,
-            hostName,
-            participantId: null,
-            participantName: null,
-            status: SessionStatus.CREATED,
-            createdAt: new Date().toISOString(),
-            startedAt: null,
-            endedAt: null,
-            duration: null,
-            metadata: {
-                hostJoinedAt: null,
-                participantJoinedAt: null,
-                qualityMetrics: [],
+        return prisma.session.create({
+            data: {
+                roomCode,
+                title: title || 'Vossle Meeting',
+                host: { connect: { id: hostId } },
+                hostName,
+                status: SessionStatus.CREATED,
             },
-        };
-        sessions.set(id, session);
-        return session;
+        });
     },
 
     /**
      * Find session by ID
      */
-    findById(id) {
-        return sessions.get(id) || null;
+    async findById(id) {
+        return prisma.session.findUnique({
+            where: { id },
+        });
     },
 
     /**
      * Find session by room code
      */
-    findByRoomCode(roomCode) {
-        for (const session of sessions.values()) {
-            if (session.roomCode === roomCode) return session;
-        }
-        return null;
+    async findByRoomCode(roomCode) {
+        return prisma.session.findUnique({
+            where: { roomCode },
+        });
     },
 
     /**
      * Join session as participant
      */
-    joinSession(sessionId, { participantId, participantName }) {
-        const session = sessions.get(sessionId);
-        if (!session) return null;
-        if (session.status === SessionStatus.ENDED) return null;
-
-        session.participantId = participantId;
-        session.participantName = participantName;
-        session.status = SessionStatus.ACTIVE;
-        session.startedAt = new Date().toISOString();
-        session.metadata.participantJoinedAt = new Date().toISOString();
-        sessions.set(sessionId, session);
-        return session;
+    async joinSession(sessionId, { participantId, participantName }) {
+        return prisma.session.update({
+            where: { id: sessionId },
+            data: {
+                participant: { connect: { id: participantId } },
+                participantName,
+                status: SessionStatus.ACTIVE,
+                startedAt: new Date(),
+                participantJoinedAt: new Date(),
+            },
+        });
     },
 
     /**
      * End a session
      */
-    endSession(sessionId) {
-        const session = sessions.get(sessionId);
+    async endSession(sessionId) {
+        const session = await prisma.session.findUnique({
+            where: { id: sessionId },
+        });
         if (!session) return null;
 
-        session.status = SessionStatus.ENDED;
-        session.endedAt = new Date().toISOString();
+        const endedAt = new Date();
+        let duration = null;
 
         if (session.startedAt) {
-            session.duration = Math.round(
-                (new Date(session.endedAt) - new Date(session.startedAt)) / 1000
+            duration = Math.round(
+                (endedAt.getTime() - new Date(session.startedAt).getTime()) / 1000
             );
         }
 
-        sessions.set(sessionId, session);
-        return session;
+        return prisma.session.update({
+            where: { id: sessionId },
+            data: {
+                status: SessionStatus.ENDED,
+                endedAt,
+                duration,
+            },
+        });
     },
 
     /**
      * Get sessions for a specific user (as host or participant)
      */
-    findByUserId(userId) {
-        const result = [];
-        for (const session of sessions.values()) {
-            if (session.hostId === userId || session.participantId === userId) {
-                result.push(session);
-            }
-        }
-        return result.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    async findByUserId(userId) {
+        return prisma.session.findMany({
+            where: {
+                OR: [
+                    { hostId: userId },
+                    { participantId: userId },
+                ],
+            },
+            orderBy: { createdAt: 'desc' },
+        });
     },
 
     /**
      * Get active sessions count
      */
-    activeCount() {
-        let count = 0;
-        for (const session of sessions.values()) {
-            if (session.status === SessionStatus.ACTIVE) count++;
-        }
-        return count;
+    async activeCount() {
+        return prisma.session.count({
+            where: { status: SessionStatus.ACTIVE },
+        });
     },
 
     /**
