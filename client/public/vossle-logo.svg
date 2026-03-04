@@ -1,0 +1,16 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Vossle Logo</title>
+  <desc id="desc">A clean, modern diamond-shaped logo with a stylized V for the Vossle video platform.</desc>
+  <defs>
+    <linearGradient id="vossleGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6366f1" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+  </defs>
+  <!-- Background diamond -->
+  <rect x="8" y="8" width="48" height="48" rx="10" ry="10" transform="rotate(45 32 32)" fill="#0f172a" />
+  <!-- Inner gradient diamond -->
+  <rect x="14" y="14" width="36" height="36" rx="8" ry="8" transform="rotate(45 32 32)" fill="url(#vossleGradient)" />
+  <!-- Stylized V mark -->
+  <path d="M24 26 L32 42 L40 26" fill="none" stroke="#f9fafb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

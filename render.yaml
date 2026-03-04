@@ -1,0 +1,33 @@
+# Render Blueprint — Vossle Server
+# Deploy at: https://dashboard.render.com/blueprints
+services:
+  - type: web
+    name: vossle-server
+    runtime: node
+    region: oregon
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: CLIENT_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE
+        value: 15m
+      - key: JWT_REFRESH_EXPIRE
+        value: 7d
+      - key: STUN_URL
+        value: stun:stun.l.google.com:19302
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "900000"
+      - key: RATE_LIMIT_MAX
+        value: "200"
+    healthCheckPath: /api/health
