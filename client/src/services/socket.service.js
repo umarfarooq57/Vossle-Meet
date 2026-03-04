@@ -5,19 +5,24 @@
 
 import { io } from 'socket.io-client';
 
-const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || 'https://vossle-meet.vercel.app';
+const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || 'https://vossle-server-production.up.railway.app';
 
 class SocketService {
     constructor() {
         this.socket = null;
         this.listeners = new Map();
+        this._connectPromise = null;
     }
 
     /**
-     * Connect to signaling server with auth token
+     * Connect to signaling server with auth token.
+     * Returns a Promise that resolves when socket is connected.
      */
     connect(token) {
-        if (this.socket?.connected) return this.socket;
+        if (this.socket?.connected) return Promise.resolve(this.socket);
+
+        // If already connecting, return the existing promise
+        if (this._connectPromise) return this._connectPromise;
 
         this.socket = io(SOCKET_URL, {
             auth: { token },
@@ -28,19 +33,32 @@ class SocketService {
             reconnectionDelayMax: 10000,
         });
 
-        this.socket.on('connect', () => {
-            console.log('[Vossle Socket] Connected:', this.socket.id);
-        });
+        this._connectPromise = new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error('Socket connection timed out'));
+            }, 15000);
 
-        this.socket.on('connect_error', (error) => {
-            console.error('[Vossle Socket] Connection error:', error.message);
+            this.socket.on('connect', () => {
+                clearTimeout(timeout);
+                console.log('[Vossle Socket] Connected:', this.socket.id);
+                this._connectPromise = null;
+                resolve(this.socket);
+            });
+
+            this.socket.on('connect_error', (error) => {
+                clearTimeout(timeout);
+                console.error('[Vossle Socket] Connection error:', error.message);
+                this._connectPromise = null;
+                reject(error);
+            });
         });
 
         this.socket.on('disconnect', (reason) => {
             console.log('[Vossle Socket] Disconnected:', reason);
+            this._connectPromise = null;
         });
 
-        return this.socket;
+        return this._connectPromise;
     }
 
     /**

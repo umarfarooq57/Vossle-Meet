@@ -149,14 +149,14 @@ const Room = () => {
             // Create peer connection
             await createPeerConnection(stream);
 
-            // Connect socket
+            // Connect socket and WAIT for it to be ready
             const token = api.getToken();
-            socketService.connect(token);
+            await socketService.connect(token);
 
-            // Setup handlers
+            // Setup handlers (socket is now connected)
             setupSignalingHandlers();
 
-            // Join room via socket
+            // Join room via socket (socket is guaranteed connected)
             socketService.emit('room:join', { roomId: sessionId, sessionId });
 
             // Add self to participants
