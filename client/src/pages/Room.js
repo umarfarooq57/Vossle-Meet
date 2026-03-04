@@ -59,7 +59,6 @@ const Room = () => {
         localVideoRef,
         remoteVideoRef,
         initializeMedia,
-        createPeerConnection,
         startCall,
         handleOffer,
         handleAnswer,
@@ -151,9 +150,6 @@ const Room = () => {
                 stream.getVideoTracks().forEach(t => { t.enabled = false; });
             }
 
-            // Create peer connection
-            await createPeerConnection(stream);
-
             // Connect socket and WAIT for it to be ready
             const token = api.getToken();
             await socketService.connect(token);
@@ -177,7 +173,7 @@ const Room = () => {
             setError(err.message || 'Failed to join meeting.');
             setStatus('ended');
         }
-    }, [sessionId, initializeMedia, createPeerConnection, lobbyAudioEnabled, lobbyVideoEnabled, user]);
+    }, [sessionId, initializeMedia, lobbyAudioEnabled, lobbyVideoEnabled, user]);
 
     // ── Signaling handlers ──
     const setupSignalingHandlers = useCallback(() => {

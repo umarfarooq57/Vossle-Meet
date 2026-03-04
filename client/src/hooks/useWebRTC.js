@@ -1,6 +1,7 @@
 /**
- * Vossle — useWebRTC Hook
+ * Vossle — useWebRTC Hook v3
  * Core WebRTC peer connection management with signaling integration.
+ * Multi-peer support with ref-based stream access to avoid stale closures.
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -14,17 +15,20 @@ const useWebRTC = (roomId) => {
     const [isAudioEnabled, setIsAudioEnabled] = useState(true);
     const [isVideoEnabled, setIsVideoEnabled] = useState(true);
     const [isScreenSharing, setIsScreenSharing] = useState(false);
-    const [remotePeer, setRemotePeer] = useState(null);
     const [qualityMetrics, setQualityMetrics] = useState(null);
 
-    // Support multiple peer connections (one per remote socket id)
-    const peerConnections = useRef(new Map()); // socketId -> RTCPeerConnection
+    // ── Refs (always current, never stale in closures) ──
+    const localStreamRef = useRef(null);
+    const peerConnections = useRef(new Map());
     const localVideoRef = useRef(null);
     const remoteVideoRef = useRef(null);
     const screenStream = useRef(null);
     const originalVideoTrack = useRef(null);
     const metricsInterval = useRef(null);
-    const lastRemotePeer = useRef(null);
+    const remotePeerRef = useRef(null);
+
+    // Keep ref in sync with React state
+    useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
 
     /**
      * Initialize local media stream
@@ -38,21 +42,22 @@ const useWebRTC = (roomId) => {
                     autoGainControl: true,
                     sampleRate: 48000,
                 },
-                video: videoConstraints === true ? {
-                    width: { ideal: 1280, max: 1920 },
-                    height: { ideal: 720, max: 1080 },
-                    frameRate: { ideal: 30, max: 60 },
-                    facingMode: 'user',
-                } : videoConstraints,
+                video: videoConstraints === true
+                    ? { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 30, max: 60 }, facingMode: 'user' }
+                    : videoConstraints,
             };
 
             const stream = await navigator.mediaDevices.getUserMedia(constraints);
+
+            // Update both state AND ref immediately so it's never stale
             setLocalStream(stream);
+            localStreamRef.current = stream;
 
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = stream;
             }
 
+            console.log('[Vossle WebRTC] Media initialized — tracks:', stream.getTracks().map(t => t.kind).join(', '));
             return stream;
         } catch (error) {
             console.error('[Vossle WebRTC] Media access error:', error);
@@ -61,94 +66,103 @@ const useWebRTC = (roomId) => {
     }, []);
 
     /**
-     * Create and configure peer connection
+     * Helper: get ICE server config (with fallback)
      */
-    const createPeerConnection = useCallback(async (stream, remoteSocketId) => {
+    const getIceConfig = useCallback(async () => {
         try {
-            // Fetch ICE servers from backend
-            let iceConfig;
-            try {
-                iceConfig = await api.getIceServers();
-            } catch {
-                iceConfig = {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' },
-                    ],
-                };
-            }
-
-            const pc = new RTCPeerConnection({
-                iceServers: iceConfig.iceServers,
-                iceTransportPolicy: iceConfig.iceTransportPolicy || 'all',
-                bundlePolicy: 'max-bundle',
-                rtcpMuxPolicy: 'require',
-            });
-
-            // Add local tracks to connection
-            if (stream) {
-                stream.getTracks().forEach((track) => {
-                    pc.addTrack(track, stream);
-                });
-            }
-
-            // Handle remote tracks
-            pc.ontrack = (event) => {
-                console.log('[Vossle WebRTC] Remote track received from', remoteSocketId, event.track.kind);
-                const [remoteStreamObj] = event.streams;
-                // remember last remote stream for main view
-                setRemoteStream(remoteStreamObj);
-                lastRemotePeer.current = remoteSocketId;
-                if (remoteVideoRef.current) {
-                    remoteVideoRef.current.srcObject = remoteStreamObj;
-                }
+            return await api.getIceServers();
+        } catch {
+            return {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun2.l.google.com:19302' },
+                    { urls: 'stun:stun3.l.google.com:19302' },
+                ],
             };
-
-            // ICE candidate handling — trickle ICE
-            pc.onicecandidate = (event) => {
-                console.log('[Vossle WebRTC] onicecandidate for', remoteSocketId, event.candidate ? 'candidate' : 'null');
-                if (event.candidate) {
-                    socketService.emit('webrtc:ice-candidate', {
-                        candidate: event.candidate,
-                        targetSocketId: remoteSocketId,
-                    });
-                }
-            };
-
-            // Connection state tracking
-            pc.onconnectionstatechange = () => {
-                setConnectionState(pc.connectionState);
-                console.log('[Vossle WebRTC] Connection state for', remoteSocketId, pc.connectionState);
-            };
-
-            pc.oniceconnectionstatechange = () => {
-                console.log('[Vossle WebRTC] ICE state for', remoteSocketId, pc.iceConnectionState);
-                if (pc.iceConnectionState === 'failed') {
-                    try { pc.restartIce(); } catch (e) { console.warn('restartIce failed', e); }
-                }
-            };
-
-            // store connection for this remote
-            if (remoteSocketId) peerConnections.current.set(remoteSocketId, pc);
-            return pc;
-        } catch (error) {
-            console.error('[Vossle WebRTC] Peer connection error:', error);
-            throw error;
         }
     }, []);
 
-    const remotePeerRef = useRef(null);
-
     /**
-     * Start call — create offer and send via signaling
+     * Create and configure a peer connection for a specific remote socket.
+     * Uses localStreamRef.current so it's NEVER stale.
      */
-    const startCall = useCallback(async (targetSocketId) => {
-        // create or reuse peer connection for target
-        let pc = peerConnections.current.get(targetSocketId);
-        if (!pc) {
-            pc = await createPeerConnection(localStream, targetSocketId);
+    const createPeerConnection = useCallback(async (remoteSocketId) => {
+        // Close existing PC for this remote if any
+        const existing = peerConnections.current.get(remoteSocketId);
+        if (existing) {
+            try { existing.close(); } catch { /* ignore */ }
+            peerConnections.current.delete(remoteSocketId);
         }
 
+        const iceConfig = await getIceConfig();
+
+        const pc = new RTCPeerConnection({
+            iceServers: iceConfig.iceServers,
+            iceTransportPolicy: iceConfig.iceTransportPolicy || 'all',
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require',
+        });
+
+        // Add local tracks from the ref (always current)
+        const stream = localStreamRef.current;
+        if (stream) {
+            stream.getTracks().forEach((track) => {
+                pc.addTrack(track, stream);
+            });
+            console.log('[Vossle WebRTC] Added', stream.getTracks().length, 'local tracks to PC for', remoteSocketId);
+        } else {
+            console.warn('[Vossle WebRTC] No local stream when creating PC for', remoteSocketId);
+        }
+
+        // Handle remote tracks
+        pc.ontrack = (event) => {
+            console.log('[Vossle WebRTC] Remote track from', remoteSocketId, event.track.kind);
+            const [remoteStreamObj] = event.streams;
+            setRemoteStream(remoteStreamObj);
+            if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = remoteStreamObj;
+            }
+        };
+
+        // ICE candidates → signaling
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                socketService.emit('webrtc:ice-candidate', {
+                    candidate: event.candidate,
+                    targetSocketId: remoteSocketId,
+                });
+            }
+        };
+
+        // Connection state tracking
+        pc.onconnectionstatechange = () => {
+            console.log('[Vossle WebRTC] Connection state for', remoteSocketId, '→', pc.connectionState);
+            setConnectionState(pc.connectionState);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            console.log('[Vossle WebRTC] ICE state for', remoteSocketId, '→', pc.iceConnectionState);
+            if (pc.iceConnectionState === 'failed') {
+                try { pc.restartIce(); } catch (e) { console.warn('restartIce failed', e); }
+            }
+        };
+
+        pc.onsignalingstatechange = () => {
+            console.log('[Vossle WebRTC] Signaling state for', remoteSocketId, '→', pc.signalingState);
+        };
+
+        peerConnections.current.set(remoteSocketId, pc);
+        console.log('[Vossle WebRTC] Created PC for', remoteSocketId, '| total PCs:', peerConnections.current.size);
+        return pc;
+    }, [getIceConfig]);
+
+    /**
+     * Start call — create SDP offer and send via signaling
+     */
+    const startCall = useCallback(async (targetSocketId) => {
+        console.log('[Vossle WebRTC] startCall →', targetSocketId);
+        const pc = await createPeerConnection(targetSocketId);
         remotePeerRef.current = targetSocketId;
 
         const offer = await pc.createOffer({
@@ -161,18 +175,15 @@ const useWebRTC = (roomId) => {
             offer: pc.localDescription,
             targetSocketId,
         });
-    }, [createPeerConnection, localStream]);
+        console.log('[Vossle WebRTC] Sent offer to', targetSocketId);
+    }, [createPeerConnection]);
 
     /**
-     * Handle incoming offer — create answer
+     * Handle incoming SDP offer — create answer
      */
     const handleOffer = useCallback(async (offer, senderSocketId) => {
-        // ensure peer connection for sender
-        let pc = peerConnections.current.get(senderSocketId);
-        if (!pc) {
-            pc = await createPeerConnection(localStream, senderSocketId);
-        }
-
+        console.log('[Vossle WebRTC] handleOffer from', senderSocketId);
+        const pc = await createPeerConnection(senderSocketId);
         remotePeerRef.current = senderSocketId;
 
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -183,14 +194,19 @@ const useWebRTC = (roomId) => {
             answer: pc.localDescription,
             targetSocketId: senderSocketId,
         });
-    }, [createPeerConnection, localStream]);
+        console.log('[Vossle WebRTC] Sent answer to', senderSocketId);
+    }, [createPeerConnection]);
 
     /**
-     * Handle incoming answer
+     * Handle incoming SDP answer
      */
     const handleAnswer = useCallback(async (answer, senderSocketId) => {
+        console.log('[Vossle WebRTC] handleAnswer from', senderSocketId);
         const pc = peerConnections.current.get(senderSocketId);
-        if (!pc) return;
+        if (!pc) {
+            console.warn('[Vossle WebRTC] No PC found for answer from', senderSocketId);
+            return;
+        }
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
     }, []);
 
@@ -199,7 +215,10 @@ const useWebRTC = (roomId) => {
      */
     const handleIceCandidate = useCallback(async (candidate, senderSocketId) => {
         const pc = peerConnections.current.get(senderSocketId);
-        if (!pc) return;
+        if (!pc) {
+            console.warn('[Vossle WebRTC] No PC for ICE from', senderSocketId);
+            return;
+        }
         try {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (error) {
@@ -211,29 +230,31 @@ const useWebRTC = (roomId) => {
      * Toggle audio
      */
     const toggleAudio = useCallback(() => {
-        if (localStream) {
-            const audioTrack = localStream.getAudioTracks()[0];
+        const stream = localStreamRef.current;
+        if (stream) {
+            const audioTrack = stream.getAudioTracks()[0];
             if (audioTrack) {
                 audioTrack.enabled = !audioTrack.enabled;
                 setIsAudioEnabled(audioTrack.enabled);
                 socketService.emit('media:toggle-audio', { enabled: audioTrack.enabled });
             }
         }
-    }, [localStream]);
+    }, []);
 
     /**
      * Toggle video
      */
     const toggleVideo = useCallback(() => {
-        if (localStream) {
-            const videoTrack = localStream.getVideoTracks()[0];
+        const stream = localStreamRef.current;
+        if (stream) {
+            const videoTrack = stream.getVideoTracks()[0];
             if (videoTrack) {
                 videoTrack.enabled = !videoTrack.enabled;
                 setIsVideoEnabled(videoTrack.enabled);
                 socketService.emit('media:toggle-video', { enabled: videoTrack.enabled });
             }
         }
-    }, [localStream]);
+    }, []);
 
     /**
      * Toggle screen sharing
@@ -255,6 +276,7 @@ const useWebRTC = (roomId) => {
                         await sender.replaceTrack(originalVideoTrack.current);
                     }
                 }
+                originalVideoTrack.current = null;
             }
             setIsScreenSharing(false);
             socketService.emit('media:screen-share', { sharing: false });
@@ -293,14 +315,17 @@ const useWebRTC = (roomId) => {
     }, [isScreenSharing]);
 
     /**
-     * Collect WebRTC quality metrics
+     * Collect quality metrics from any active PC
      */
     const collectMetrics = useCallback(async () => {
-        const pc = peerConnection.current;
-        if (!pc) return;
+        let activePc = null;
+        for (const pc of peerConnections.current.values()) {
+            if (pc.connectionState === 'connected') { activePc = pc; break; }
+        }
+        if (!activePc) return;
 
         try {
-            const stats = await pc.getStats();
+            const stats = await activePc.getStats();
             let metrics = {};
 
             stats.forEach((report) => {
@@ -331,44 +356,42 @@ const useWebRTC = (roomId) => {
 
             setQualityMetrics(metrics);
             socketService.emit('quality:report', metrics);
-        } catch (error) {
-            // Silently fail on metrics collection
-        }
+        } catch { /* silent */ }
     }, []);
 
     /**
-     * End call and cleanup
+     * End call and cleanup ALL peer connections
      */
     const endCall = useCallback(() => {
-        // Stop metrics collection
         if (metricsInterval.current) {
             clearInterval(metricsInterval.current);
             metricsInterval.current = null;
         }
 
-        // Stop screen sharing
         if (screenStream.current) {
             screenStream.current.getTracks().forEach((t) => t.stop());
             screenStream.current = null;
         }
 
-        // Close peer connection
-        if (peerConnection.current) {
-            peerConnection.current.close();
-            peerConnection.current = null;
+        // Close every peer connection
+        for (const [id, pc] of peerConnections.current) {
+            try { pc.close(); } catch { /* ignore */ }
         }
+        peerConnections.current.clear();
 
         // Stop local media
-        if (localStream) {
-            localStream.getTracks().forEach((t) => t.stop());
+        const stream = localStreamRef.current;
+        if (stream) {
+            stream.getTracks().forEach((t) => t.stop());
         }
 
         setLocalStream(null);
+        localStreamRef.current = null;
         setRemoteStream(null);
         setConnectionState('closed');
         setIsScreenSharing(false);
-        setRemotePeer(null);
-    }, [localStream]);
+        originalVideoTrack.current = null;
+    }, []);
 
     // Start metrics collection when connected
     useEffect(() => {
@@ -383,23 +406,18 @@ const useWebRTC = (roomId) => {
     }, [connectionState, collectMetrics]);
 
     return {
-        // State
         localStream,
         remoteStream,
         connectionState,
         isAudioEnabled,
         isVideoEnabled,
         isScreenSharing,
-        remotePeer,
         qualityMetrics,
 
-        // Refs
         localVideoRef,
         remoteVideoRef,
 
-        // Actions
         initializeMedia,
-        createPeerConnection,
         startCall,
         handleOffer,
         handleAnswer,
