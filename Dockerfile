@@ -2,6 +2,7 @@
 FROM node:20-alpine AS server
 WORKDIR /app/server
 COPY server/package*.json ./
+COPY server/prisma ./prisma
 RUN npm ci --only=production
 COPY server/ .
 EXPOSE 5000
