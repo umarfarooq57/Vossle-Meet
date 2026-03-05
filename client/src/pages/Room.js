@@ -59,6 +59,7 @@ const Room = () => {
         localVideoRef,
         remoteVideoRef,
         initializeMedia,
+        prefetchIceConfig,
         createPeerConnection,
         handleOffer,
         handleAnswer,
@@ -159,10 +160,12 @@ const Room = () => {
                 setRemoteUserName(peer.userName);
                 setStatus('connecting');
 
-                // Newcomer
-                const isPolite = getIsPolite(peer.socketId);
-                console.log('[Vossle Room] Creating PC for:', peer.socketId, 'isPolite:', isPolite);
-                await createPeerConnection(peer.socketId, isPolite);
+                // Do NOT create a PC here.
+                // The existing user (who receives room:user-joined) will create
+                // a PC and send an offer. Our handleOffer handler will create
+                // our PC on demand when that offer arrives, avoiding the race
+                // condition where getIceConfig() delays PC creation long enough
+                // for a competing PC to be created by handleOffer.
 
                 setParticipants(prev => {
                     const others = prev.filter(p => p.id !== peer.socketId);
@@ -310,6 +313,10 @@ const Room = () => {
                 stream.getVideoTracks().forEach(t => { t.enabled = false; });
             }
 
+            // Pre-fetch ICE config so createPeerConnection is instant later
+            // (eliminates the race where a remote offer arrives before our PC exists)
+            await prefetchIceConfig();
+
             // Connect socket and WAIT for it to be ready
             const token = api.getToken();
             await socketService.connect(token);
@@ -338,7 +345,7 @@ const Room = () => {
             setStatus('ended');
             hasInitialized.current = false;
         }
-    }, [sessionId, initializeMedia, lobbyAudioEnabled, lobbyVideoEnabled, user, setupSignalingHandlers]);
+    }, [sessionId, initializeMedia, prefetchIceConfig, lobbyAudioEnabled, lobbyVideoEnabled, user, setupSignalingHandlers]);
 
     // ── Cleanup signaling on unmount ──
     useEffect(() => {

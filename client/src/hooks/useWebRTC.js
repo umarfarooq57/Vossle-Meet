@@ -34,6 +34,14 @@ const useWebRTC = (roomId) => {
     const iceCandidateBuffer = useRef(new Map()); // Map<socketId, RTCIceCandidate[]>
     const remoteDescReady = useRef(new Set());    // Set<socketId> — remote desc has resolved
 
+    // ICE config cache — avoids repeated HTTP requests and the race condition
+    // where getIceConfig() delays createPeerConnection long enough for a
+    // remote offer to arrive and create a competing peer connection.
+    const iceConfigCache = useRef(null);
+
+    // Prevent concurrent createPeerConnection calls for the same remote socket
+    const pcCreationLocks = useRef(new Map()); // Map<socketId, Promise<RTCPeerConnection>>
+
     // Sync ref
     useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
 
@@ -82,20 +90,23 @@ const useWebRTC = (roomId) => {
      * Get ICE configuration from server, with robust fallback
      */
     const getIceConfig = useCallback(async () => {
+        if (iceConfigCache.current) return iceConfigCache.current;
         try {
             const data = await api.getIceServers();
             // API returns { iceServers: [...], iceTransportPolicy: 'all' }
             if (data && data.iceServers && data.iceServers.length > 0) {
-                return {
+                const config = {
                     iceServers: data.iceServers,
                     iceTransportPolicy: data.iceTransportPolicy || 'all',
                 };
+                iceConfigCache.current = config;
+                return config;
             }
         } catch (err) {
             console.warn('[Vossle WebRTC] Failed to fetch ICE config from server, using fallback:', err.message);
         }
         // Fallback ICE config with STUN + free TURN
-        return {
+        const fallback = {
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
                 { urls: 'stun:stun1.l.google.com:19302' },
@@ -117,7 +128,19 @@ const useWebRTC = (roomId) => {
             ],
             iceTransportPolicy: 'all',
         };
+        iceConfigCache.current = fallback;
+        return fallback;
     }, []);
+
+    /**
+     * Pre-fetch ICE config so createPeerConnection is synchronous later.
+     * Call this during joinMeeting, before the socket room join.
+     */
+    const prefetchIceConfig = useCallback(async () => {
+        if (!iceConfigCache.current) {
+            await getIceConfig();
+        }
+    }, [getIceConfig]);
 
     /**
      * Create Peer Connection with Perfect Negotiation logic
@@ -128,9 +151,17 @@ const useWebRTC = (roomId) => {
             return existing;
         }
 
+        // If another call is already creating a PC for this socket, wait for it
+        const pending = pcCreationLocks.current.get(remoteSocketId);
+        if (pending) {
+            return pending;
+        }
+
+        const creationPromise = (async () => {
         // Close any stale connection
-        if (existing) {
-            existing.close();
+        const stale = peerConnections.current.get(remoteSocketId);
+        if (stale) {
+            stale.close();
             peerConnections.current.delete(remoteSocketId);
         }
 
@@ -219,6 +250,14 @@ const useWebRTC = (roomId) => {
         startQualityMetrics(pc);
 
         return pc;
+        })();
+
+        pcCreationLocks.current.set(remoteSocketId, creationPromise);
+        try {
+            return await creationPromise;
+        } finally {
+            pcCreationLocks.current.delete(remoteSocketId);
+        }
     }, [getIceConfig]);
 
     /**
@@ -405,6 +444,7 @@ const useWebRTC = (roomId) => {
         peerConnections.current.clear();
         iceCandidateBuffer.current.clear();
         remoteDescReady.current.clear();
+        pcCreationLocks.current.clear();
         if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
         setLocalStream(null);
         setRemoteStream(null);
@@ -420,6 +460,7 @@ const useWebRTC = (roomId) => {
             peerConnections.current.clear();
             iceCandidateBuffer.current.clear();
             remoteDescReady.current.clear();
+            pcCreationLocks.current.clear();
             if (localStreamRef.current) {
                 localStreamRef.current.getTracks().forEach(t => t.stop());
             }
@@ -429,7 +470,7 @@ const useWebRTC = (roomId) => {
     return {
         localStream, remoteStream, connectionState, isAudioEnabled, isVideoEnabled, isScreenSharing,
         localVideoRef, remoteVideoRef, qualityMetrics,
-        initializeMedia, createPeerConnection, handleOffer, handleAnswer, handleIceCandidate,
+        initializeMedia, prefetchIceConfig, createPeerConnection, handleOffer, handleAnswer, handleIceCandidate,
         toggleAudio, toggleVideo, toggleScreenShare, endCall
     };
 };
