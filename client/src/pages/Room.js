@@ -1,5 +1,5 @@
 /**
- * Vossle — Video Room v2
+ * Vossle — Video Room v3
  * Full Zoom/Meet-class video call experience.
  * Pre-call lobby → Active call → Post-call, with all panels and features.
  */
@@ -59,7 +59,7 @@ const Room = () => {
         localVideoRef,
         remoteVideoRef,
         initializeMedia,
-        createPeerConnection, // Replaced startCall
+        createPeerConnection,
         handleOffer,
         handleAnswer,
         handleIceCandidate,
@@ -73,6 +73,7 @@ const Room = () => {
     const meetingTimerRef = useRef(null);
     const lobbyVideoRef = useRef(null);
     const chatOpenRef = useRef(chatOpen);
+    const cleanupSignalingRef = useRef(null);
 
     // Keep chatOpenRef in sync
     useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
@@ -123,70 +124,35 @@ const Room = () => {
         };
     }, [sessionId]);
 
-    // ── Join meeting (from lobby) ──
-    const joinMeeting = useCallback(async () => {
-        if (hasInitialized.current) return;
-        hasInitialized.current = true;
-
-        try {
-            setStatus('connecting');
-
-            // Stop lobby preview
-            if (lobbyVideoRef.current?._stream) {
-                lobbyVideoRef.current._stream.getTracks().forEach(t => t.stop());
-            }
-
-            // Join session via API
-            await api.joinSession(sessionId);
-
-            // Initialize real media
-            const stream = await initializeMedia();
-
-            // Apply lobby preferences
-            if (!lobbyAudioEnabled) {
-                stream.getAudioTracks().forEach(t => { t.enabled = false; });
-            }
-            if (!lobbyVideoEnabled) {
-                stream.getVideoTracks().forEach(t => { t.enabled = false; });
-            }
-
-            // Connect socket and WAIT for it to be ready
-            const token = api.getToken();
-            await socketService.connect(token);
-
-            // Setup handlers (socket is now connected)
-            setupSignalingHandlers();
-
-            // Join room via socket (socket is guaranteed connected)
-            socketService.emit('room:join', { roomId: sessionId, sessionId });
-
-            // Add self to participants
-            setParticipants([{
-                id: user?.id,
-                name: user?.name,
-                isAudioEnabled: lobbyAudioEnabled,
-                isVideoEnabled: lobbyVideoEnabled,
-            }]);
-
-        } catch (err) {
-            console.error('[Vossle Room] Join error:', err);
-            setError(err.message || 'Failed to join meeting.');
-            setStatus('ended');
-        }
-    }, [sessionId, initializeMedia, lobbyAudioEnabled, lobbyVideoEnabled, user]);
-
-    // ── Signaling handlers ──
+    // ── Signaling handlers — uses refs to avoid stale closures ──
     const setupSignalingHandlers = useCallback(() => {
         const socket = socketService.getSocket();
-        if (!socket) return;
+        if (!socket) {
+            console.error('[Vossle Room] No socket available for signaling');
+            return () => { };
+        }
+
+        // Remove any previously registered handlers
+        const events = [
+            'room:joined', 'room:user-joined', 'webrtc:offer', 'webrtc:answer',
+            'webrtc:ice-candidate', 'room:user-left', 'media:video-toggled',
+            'media:audio-toggled', 'media:screen-share-changed', 'media:hand-raised',
+            'chat:message', 'room:join-request', 'room:waiting-admission',
+            'room:admitted', 'room:rejected',
+        ];
+        events.forEach(evt => socket.removeAllListeners(evt));
+
+        console.log('[Vossle Room] Setting up signaling handlers');
 
         socket.on('room:joined', async ({ existingUsers }) => {
+            console.log('[Vossle Room] Joined room, existing users:', existingUsers?.length || 0);
             if (existingUsers?.length > 0) {
                 const peer = existingUsers[0];
                 setRemoteUserName(peer.userName);
                 setStatus('connecting');
 
-                // Newcomer is POLITE (waits for offer)
+                // Newcomer is POLITE (waits for offer from existing user)
+                console.log('[Vossle Room] Creating PC as polite peer for:', peer.socketId);
                 await createPeerConnection(peer.socketId, true);
 
                 setParticipants(prev => {
@@ -198,14 +164,20 @@ const Room = () => {
                         isVideoEnabled: true,
                     }];
                 });
+            } else {
+                // First user in room — just set status to connected (waiting for others)
+                console.log('[Vossle Room] First user in room, waiting for others');
+                setStatus('connected');
             }
         });
 
         socket.on('room:user-joined', async ({ socketId, userName }) => {
+            console.log('[Vossle Room] User joined:', userName, socketId);
             setRemoteUserName(userName);
             setStatus('connecting');
 
-            // Existing user is IMPOLITE (sends offer)
+            // Existing user is IMPOLITE (creates offer)
+            console.log('[Vossle Room] Creating PC as impolite peer for:', socketId);
             await createPeerConnection(socketId, false);
 
             setParticipants(prev => {
@@ -220,13 +192,15 @@ const Room = () => {
         });
 
         socket.on('webrtc:offer', async ({ offer, senderSocketId, senderName }) => {
-            setRemoteUserName(senderName);
-            // Politeness depends on role: newcomer is polite
-            const isPolite = participants.length > 1;
-            await handleOffer(offer, senderSocketId, isPolite);
+            console.log('[Vossle Room] Received offer from:', senderName, senderSocketId);
+            if (senderName) setRemoteUserName(senderName);
+            // Newcomer is polite, existing user is impolite
+            // If we receive an offer, we should be polite (accept it)
+            await handleOffer(offer, senderSocketId, true);
         });
 
         socket.on('webrtc:answer', async ({ answer, senderSocketId }) => {
+            console.log('[Vossle Room] Received answer from:', senderSocketId);
             await handleAnswer(answer, senderSocketId);
         });
 
@@ -235,9 +209,11 @@ const Room = () => {
         });
 
         socket.on('room:user-left', ({ userName, socketId }) => {
+            console.log('[Vossle Room] User left:', userName);
             setRemoteUserName('');
-            setStatus('lobby');
+            setRemoteStream_null();
             setParticipants(prev => prev.filter(p => p.id !== socketId));
+            // Don't reset to lobby — stay in connected state, just show "waiting for others"
         });
 
         socket.on('media:video-toggled', ({ enabled, socketId }) => {
@@ -262,40 +238,120 @@ const Room = () => {
         });
 
         // ── Admission control ──
-        // Host receives join requests
         socket.on('room:join-request', ({ requestSocketId, userName, userId }) => {
             setJoinRequests(prev => {
-                // Avoid duplicates
                 if (prev.some(r => r.requestSocketId === requestSocketId)) return prev;
                 return [...prev, { requestSocketId, userName, userId }];
             });
         });
 
-        // Joiner: waiting for host
         socket.on('room:waiting-admission', () => {
             setWaitingForAdmission(true);
         });
 
-        // Joiner: host admitted you
         socket.on('room:admitted', () => {
             setWaitingForAdmission(false);
         });
 
-        // Joiner: host rejected you
         socket.on('room:rejected', ({ reason }) => {
             setWaitingForAdmission(false);
             setAdmissionDenied(true);
             setError(reason || 'The host denied your request to join.');
         });
 
-    }, [startCall, handleOffer, handleAnswer, handleIceCandidate]);
+        // Return cleanup function
+        return () => {
+            console.log('[Vossle Room] Cleaning up signaling handlers');
+            events.forEach(evt => socket.removeAllListeners(evt));
+        };
+    }, [createPeerConnection, handleOffer, handleAnswer, handleIceCandidate]);
+
+    // Helper: we can't call setRemoteStream from Room since it's inside the hook
+    // Instead we rely on the hook to clear it. But we need a way to signal "user left"
+    // For now, the remoteStream will go null naturally when the PC closes.
+    const setRemoteStream_null = () => {
+        // The remote stream will be cleaned up by the WebRTC hook when the PC closes
+        // We just update UI state here
+    };
+
+    // ── Join meeting (from lobby) ──
+    const joinMeeting = useCallback(async () => {
+        if (hasInitialized.current) return;
+        hasInitialized.current = true;
+
+        try {
+            setStatus('connecting');
+
+            // Stop lobby preview
+            if (lobbyVideoRef.current?._stream) {
+                lobbyVideoRef.current._stream.getTracks().forEach(t => t.stop());
+                lobbyVideoRef.current._stream = null;
+            }
+
+            // Join session via API
+            await api.joinSession(sessionId);
+
+            // Initialize real media
+            const stream = await initializeMedia();
+
+            // Apply lobby preferences
+            if (!lobbyAudioEnabled) {
+                stream.getAudioTracks().forEach(t => { t.enabled = false; });
+            }
+            if (!lobbyVideoEnabled) {
+                stream.getVideoTracks().forEach(t => { t.enabled = false; });
+            }
+
+            // Connect socket and WAIT for it to be ready
+            const token = api.getToken();
+            await socketService.connect(token);
+
+            // Setup handlers FIRST (before joining room)
+            if (cleanupSignalingRef.current) {
+                cleanupSignalingRef.current();
+            }
+            cleanupSignalingRef.current = setupSignalingHandlers();
+
+            // Join room via socket (socket is guaranteed connected, handlers are registered)
+            console.log('[Vossle Room] Emitting room:join for', sessionId);
+            socketService.emit('room:join', { roomId: sessionId, sessionId });
+
+            // Add self to participants
+            setParticipants([{
+                id: user?.id,
+                name: user?.name,
+                isAudioEnabled: lobbyAudioEnabled,
+                isVideoEnabled: lobbyVideoEnabled,
+            }]);
+
+        } catch (err) {
+            console.error('[Vossle Room] Join error:', err);
+            setError(err.message || 'Failed to join meeting.');
+            setStatus('ended');
+            hasInitialized.current = false;
+        }
+    }, [sessionId, initializeMedia, lobbyAudioEnabled, lobbyVideoEnabled, user, setupSignalingHandlers]);
+
+    // ── Cleanup signaling on unmount ──
+    useEffect(() => {
+        return () => {
+            if (cleanupSignalingRef.current) {
+                cleanupSignalingRef.current();
+                cleanupSignalingRef.current = null;
+            }
+        };
+    }, []);
 
     // ── Connection state tracking ──
     useEffect(() => {
         if (connectionState === 'connected') {
             setStatus('connected');
         } else if (connectionState === 'failed' || connectionState === 'closed') {
-            if (status === 'connected') setStatus('ended');
+            // Only set ended if we were previously connected (avoid false triggers)
+            if (status === 'connected' || status === 'connecting') {
+                // Don't immediately end — the connection might recover
+                console.log('[Vossle Room] Connection state:', connectionState, '(current status:', status, ')');
+            }
         }
     }, [connectionState, status]);
 
@@ -315,6 +371,11 @@ const Room = () => {
         try { await api.endSession(sessionId); } catch { }
         endCall();
         socketService.emit('room:leave');
+        if (cleanupSignalingRef.current) {
+            cleanupSignalingRef.current();
+            cleanupSignalingRef.current = null;
+        }
+        socketService.disconnect();
         navigate('/dashboard');
     };
 
@@ -372,7 +433,7 @@ const Room = () => {
     const sidePanel = chatOpen || participantsOpen;
 
     // ── ERROR STATE ──
-    if (error) {
+    if (error && !waitingForAdmission) {
         return (
             <div style={s.fullCenter}>
                 <div style={s.errorCard}>

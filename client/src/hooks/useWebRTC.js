@@ -1,5 +1,5 @@
 /**
- * Vossle — useWebRTC Hook v4
+ * Vossle — useWebRTC Hook v5
  * Implements "Perfect Negotiation" pattern to eliminate signaling glare.
  * Handles asymmetrical role (polite vs impolite) for robust connections.
  */
@@ -8,7 +8,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import socketService from '../services/socket.service';
 import api from '../services/api.service';
 
-const useWebRTC = (roomId, isPoliteInitial = false) => {
+const useWebRTC = (roomId) => {
     const [localStream, setLocalStream] = useState(null);
     const [remoteStream, setRemoteStream] = useState(null);
     const [connectionState, setConnectionState] = useState('new');
@@ -29,7 +29,6 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
     // Perfect Negotiation State
     const makingOffer = useRef(false);
     const ignoreOffer = useRef(false);
-    const isSettingRemoteAnswerPending = useRef(false);
 
     // Sync ref
     useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
@@ -54,20 +53,66 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
                 localVideoRef.current.srcObject = stream;
             }
 
-            console.log('[Vossle WebRTC] Media initialized');
+            console.log('[Vossle WebRTC] Media initialized:', stream.getTracks().map(t => `${t.kind}:${t.label}`));
             return stream;
         } catch (error) {
             console.error('[Vossle WebRTC] Media error:', error);
+            // Fallback: try audio-only if video fails
+            if (videoConstraints) {
+                try {
+                    const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                    setLocalStream(audioOnly);
+                    localStreamRef.current = audioOnly;
+                    setIsVideoEnabled(false);
+                    console.warn('[Vossle WebRTC] Fallback to audio-only');
+                    return audioOnly;
+                } catch (audioErr) {
+                    console.error('[Vossle WebRTC] Audio-only fallback also failed:', audioErr);
+                }
+            }
             throw error;
         }
     }, []);
 
+    /**
+     * Get ICE configuration from server, with robust fallback
+     */
     const getIceConfig = useCallback(async () => {
         try {
-            return await api.getIceServers();
-        } catch {
-            return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+            const data = await api.getIceServers();
+            // API returns { iceServers: [...], iceTransportPolicy: 'all' }
+            if (data && data.iceServers && data.iceServers.length > 0) {
+                return {
+                    iceServers: data.iceServers,
+                    iceTransportPolicy: data.iceTransportPolicy || 'all',
+                };
+            }
+        } catch (err) {
+            console.warn('[Vossle WebRTC] Failed to fetch ICE config from server, using fallback:', err.message);
         }
+        // Fallback ICE config with STUN + free TURN
+        return {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                {
+                    urls: 'turn:openrelay.metered.ca:80',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject',
+                },
+                {
+                    urls: 'turn:openrelay.metered.ca:443',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject',
+                },
+                {
+                    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                    username: 'openrelayproject',
+                    credential: 'openrelayproject',
+                },
+            ],
+            iceTransportPolicy: 'all',
+        };
     }, []);
 
     /**
@@ -75,72 +120,144 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
      */
     const createPeerConnection = useCallback(async (remoteSocketId, isPolite) => {
         const existing = peerConnections.current.get(remoteSocketId);
-        if (existing) return existing;
-
-        const iceConfig = await getIceConfig();
-        const pc = new RTCPeerConnection(iceConfig);
-
-        // Track management
-        const stream = localStreamRef.current;
-        if (stream) {
-            stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        if (existing && existing.connectionState !== 'closed' && existing.connectionState !== 'failed') {
+            return existing;
         }
 
-        pc.ontrack = ({ streams: [remoteStreamObj] }) => {
+        // Close any stale connection
+        if (existing) {
+            existing.close();
+            peerConnections.current.delete(remoteSocketId);
+        }
+
+        const iceConfig = await getIceConfig();
+        console.log('[Vossle WebRTC] Creating PC with config:', iceConfig.iceServers.length, 'servers, polite:', isPolite);
+        const pc = new RTCPeerConnection(iceConfig);
+
+        // Add local tracks to the connection
+        const stream = localStreamRef.current;
+        if (stream) {
+            stream.getTracks().forEach(track => {
+                console.log('[Vossle WebRTC] Adding track:', track.kind, track.label);
+                pc.addTrack(track, stream);
+            });
+        } else {
+            console.warn('[Vossle WebRTC] No local stream when creating PC!');
+        }
+
+        // Handle remote tracks
+        pc.ontrack = ({ streams: [remoteStreamObj], track }) => {
+            console.log('[Vossle WebRTC] Remote track received:', track.kind, track.label);
             setRemoteStream(remoteStreamObj);
             if (remoteVideoRef.current) {
                 remoteVideoRef.current.srcObject = remoteStreamObj;
             }
+
+            // Ensure the remote video plays
+            track.onunmute = () => {
+                console.log('[Vossle WebRTC] Remote track unmuted:', track.kind);
+                if (remoteVideoRef.current && remoteVideoRef.current.srcObject !== remoteStreamObj) {
+                    remoteVideoRef.current.srcObject = remoteStreamObj;
+                }
+            };
         };
 
+        // ICE candidates
         pc.onicecandidate = ({ candidate }) => {
             if (candidate) {
                 socketService.emit('webrtc:ice-candidate', { candidate, targetSocketId: remoteSocketId });
             }
         };
 
+        pc.onicecandidateerror = (event) => {
+            // Only warn on non-trivial errors
+            if (event.errorCode !== 701) {
+                console.warn('[Vossle WebRTC] ICE candidate error:', event.errorCode, event.errorText);
+            }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            console.log(`[Vossle WebRTC] ICE state (${remoteSocketId}): ${pc.iceConnectionState}`);
+            if (pc.iceConnectionState === 'failed') {
+                // Attempt ICE restart
+                console.warn('[Vossle WebRTC] ICE failed, attempting restart...');
+                pc.restartIce();
+            }
+        };
+
         pc.onconnectionstatechange = () => {
-            setConnectionState(pc.connectionState);
-            console.log(`[WebRTC] Connection (${remoteSocketId}): ${pc.connectionState}`);
+            const state = pc.connectionState;
+            console.log(`[Vossle WebRTC] Connection state (${remoteSocketId}): ${state}`);
+            setConnectionState(state);
         };
 
         // ── Perfect Negotiation: NegotiationNeeded ──
         pc.onnegotiationneeded = async () => {
             try {
                 makingOffer.current = true;
+                console.log('[Vossle WebRTC] Negotiation needed, creating offer...');
                 await pc.setLocalDescription();
                 socketService.emit('webrtc:offer', {
                     offer: pc.localDescription,
                     targetSocketId: remoteSocketId,
                 });
+                console.log('[Vossle WebRTC] Offer sent to', remoteSocketId);
             } catch (err) {
-                console.error('[WebRTC] Negotiation error:', err);
+                console.error('[Vossle WebRTC] Negotiation error:', err);
             } finally {
                 makingOffer.current = false;
             }
         };
 
         peerConnections.current.set(remoteSocketId, pc);
+
+        // Start quality metrics collection
+        startQualityMetrics(pc);
+
         return pc;
     }, [getIceConfig]);
+
+    /**
+     * Collect quality metrics periodically
+     */
+    const startQualityMetrics = (pc) => {
+        if (metricsInterval.current) clearInterval(metricsInterval.current);
+        metricsInterval.current = setInterval(async () => {
+            try {
+                const stats = await pc.getStats();
+                let roundTripTime = null;
+                stats.forEach(report => {
+                    if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                        roundTripTime = report.currentRoundTripTime;
+                    }
+                });
+                if (roundTripTime !== null) {
+                    setQualityMetrics({ connection: { roundTripTime } });
+                }
+            } catch { }
+        }, 5000);
+    };
 
     /**
      * Handle SDP Offer with Collision/Glare Management
      */
     const handleOffer = useCallback(async (offer, senderSocketId, isPolite) => {
-        const pc = await createPeerConnection(senderSocketId, isPolite);
+        let pc = peerConnections.current.get(senderSocketId);
+        if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+            pc = await createPeerConnection(senderSocketId, isPolite);
+        }
 
         try {
             const offerCollision = (makingOffer.current || pc.signalingState !== 'stable');
             ignoreOffer.current = !isPolite && offerCollision;
 
             if (ignoreOffer.current) {
-                console.warn('[WebRTC] Glare detected: Ignoring offer (impolite role)');
+                console.warn('[Vossle WebRTC] Glare detected: Ignoring offer (impolite role)');
                 return;
             }
 
-            isSettingRemoteAnswerPending.current = false;
-            await pc.setRemoteDescription(offer);
+            console.log('[Vossle WebRTC] Processing offer from', senderSocketId, 'polite:', isPolite);
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
             if (offer.type === 'offer') {
                 await pc.setLocalDescription();
@@ -148,9 +265,10 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
                     answer: pc.localDescription,
                     targetSocketId: senderSocketId,
                 });
+                console.log('[Vossle WebRTC] Answer sent to', senderSocketId);
             }
         } catch (err) {
-            console.error('[WebRTC] Offer handling error:', err);
+            console.error('[Vossle WebRTC] Offer handling error:', err);
         }
     }, [createPeerConnection]);
 
@@ -159,11 +277,15 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
      */
     const handleAnswer = useCallback(async (answer, senderSocketId) => {
         const pc = peerConnections.current.get(senderSocketId);
-        if (!pc) return;
+        if (!pc) {
+            console.warn('[Vossle WebRTC] No PC for answer from', senderSocketId);
+            return;
+        }
         try {
-            await pc.setRemoteDescription(answer);
+            console.log('[Vossle WebRTC] Processing answer from', senderSocketId);
+            await pc.setRemoteDescription(new RTCSessionDescription(answer));
         } catch (err) {
-            console.error('[WebRTC] Answer handling error:', err);
+            console.error('[Vossle WebRTC] Answer handling error:', err);
         }
     }, []);
 
@@ -174,10 +296,10 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
         const pc = peerConnections.current.get(senderSocketId);
         if (!pc) return;
         try {
-            await pc.addIceCandidate(candidate);
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (err) {
             if (!ignoreOffer.current) {
-                console.error('[WebRTC] ICE error:', err);
+                console.error('[Vossle WebRTC] ICE error:', err);
             }
         }
     }, []);
@@ -236,7 +358,7 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
                 setIsScreenSharing(true);
                 socketService.emit('media:screen-share', { sharing: true });
             } catch (err) {
-                console.error('[WebRTC] Screen share error:', err);
+                console.error('[Vossle WebRTC] Screen share error:', err);
             }
         }
     }, [isScreenSharing]);
@@ -251,6 +373,18 @@ const useWebRTC = (roomId, isPoliteInitial = false) => {
         setRemoteStream(null);
         setConnectionState('closed');
         setIsScreenSharing(false);
+    }, []);
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            if (metricsInterval.current) clearInterval(metricsInterval.current);
+            peerConnections.current.forEach(pc => pc.close());
+            peerConnections.current.clear();
+            if (localStreamRef.current) {
+                localStreamRef.current.getTracks().forEach(t => t.stop());
+            }
+        };
     }, []);
 
     return {

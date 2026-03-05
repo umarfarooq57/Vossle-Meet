@@ -63,7 +63,7 @@ const initializeSocket = (httpServer) => {
     });
 
     io.on('connection', (socket) => {
-        console.log(`[Vossle] User connected: ${socket.userName} (${socket.id})`);
+        console.log(`[Vossle] User connected: ${socket.userName} (${socket.id}) via ${socket.conn.transport.name}`);
 
         // Store connection
         connectedUsers.set(socket.id, {
@@ -132,29 +132,22 @@ const initializeSocket = (httpServer) => {
 
                 // Check if room already has members (host is in)
                 const roomMembers = rooms.get(roomId);
-                if (roomMembers && roomMembers.size > 0) {
-                    // Room has a host — send join request instead of direct join
+                const hasExistingUsers = roomMembers && roomMembers.size > 0;
+
+                if (hasExistingUsers) {
+                    // Room has users — for now, join directly (admission can be enabled later)
+                    // Direct join is more reliable for MVP; admission control adds complexity
                     socket._pendingRoomId = roomId;
-                    console.log(`[Vossle] ${socket.userName} requesting to join room ${roomId}`);
-
-                    // Send join request to all existing room members (host)
-                    for (const memberId of roomMembers) {
-                        io.to(memberId).emit('room:join-request', {
-                            requestSocketId: socket.id,
-                            userId: socket.userId,
-                            userName: socket.userName,
-                            roomId,
-                        });
-                    }
-
-                    // Notify the requester they're waiting
-                    socket.emit('room:waiting-admission', { roomId });
+                    console.log(`[Vossle] ${socket.userName} joining room ${roomId} (${roomMembers.size} existing users)`);
+                    addUserToRoom(socket);
                 } else {
                     // First person (host) — join directly
                     socket._pendingRoomId = roomId;
+                    console.log(`[Vossle] ${socket.userName} creating room ${roomId} as host`);
                     addUserToRoom(socket);
                 }
             } catch (error) {
+                console.error(`[Vossle] Room join error:`, error);
                 socket.emit('error', { message: 'Failed to join room.' });
             }
         });

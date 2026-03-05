@@ -10,7 +10,6 @@ const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || 'http://localhost:5000';
 class SocketService {
     constructor() {
         this.socket = null;
-        this.listeners = new Map();
         this._connectPromise = null;
     }
 
@@ -24,19 +23,31 @@ class SocketService {
         // If already connecting, return the existing promise
         if (this._connectPromise) return this._connectPromise;
 
+        // Disconnect any stale socket first
+        if (this.socket) {
+            this.socket.removeAllListeners();
+            this.socket.disconnect();
+            this.socket = null;
+        }
+
+        console.log('[Vossle Socket] Connecting to', SOCKET_URL);
+
         this.socket = io(SOCKET_URL, {
             auth: { token },
             transports: ['websocket', 'polling'],
             reconnection: true,
-            reconnectionAttempts: 10,
+            reconnectionAttempts: 15,
             reconnectionDelay: 1000,
             reconnectionDelayMax: 10000,
+            timeout: 20000,
+            forceNew: true,
         });
 
         this._connectPromise = new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
+                this._connectPromise = null;
                 reject(new Error('Socket connection timed out'));
-            }, 15000);
+            }, 20000);
 
             this.socket.on('connect', () => {
                 clearTimeout(timeout);
@@ -46,16 +57,28 @@ class SocketService {
             });
 
             this.socket.on('connect_error', (error) => {
-                clearTimeout(timeout);
                 console.error('[Vossle Socket] Connection error:', error.message);
-                this._connectPromise = null;
-                reject(error);
+                // Don't reject on first error — socket.io will retry
+                // Only reject if this is the initial connection attempt
+                if (this._connectPromise) {
+                    clearTimeout(timeout);
+                    this._connectPromise = null;
+                    reject(error);
+                }
             });
         });
 
         this.socket.on('disconnect', (reason) => {
             console.log('[Vossle Socket] Disconnected:', reason);
             this._connectPromise = null;
+        });
+
+        this.socket.on('reconnect', (attemptNumber) => {
+            console.log('[Vossle Socket] Reconnected after', attemptNumber, 'attempts');
+        });
+
+        this.socket.on('reconnect_failed', () => {
+            console.error('[Vossle Socket] Reconnection failed after all attempts');
         });
 
         return this._connectPromise;
@@ -66,8 +89,10 @@ class SocketService {
      */
     disconnect() {
         if (this.socket) {
+            this.socket.removeAllListeners();
             this.socket.disconnect();
             this.socket = null;
+            this._connectPromise = null;
         }
     }
 
@@ -79,11 +104,20 @@ class SocketService {
     }
 
     /**
+     * Check if connected
+     */
+    isConnected() {
+        return this.socket?.connected === true;
+    }
+
+    /**
      * Emit event to server
      */
     emit(event, data) {
         if (this.socket?.connected) {
             this.socket.emit(event, data);
+        } else {
+            console.warn('[Vossle Socket] Cannot emit', event, '— not connected');
         }
     }
 
