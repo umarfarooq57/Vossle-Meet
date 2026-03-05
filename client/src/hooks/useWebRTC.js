@@ -30,6 +30,10 @@ const useWebRTC = (roomId) => {
     const makingOffer = useRef(false);
     const ignoreOffer = useRef(false);
 
+    // ICE candidate buffering: candidates that arrive before remote description is set
+    const iceCandidateBuffer = useRef(new Map()); // Map<socketId, RTCIceCandidate[]>
+    const remoteDescReady = useRef(new Set());    // Set<socketId> — remote desc has resolved
+
     // Sync ref
     useEffect(() => { localStreamRef.current = localStream; }, [localStream]);
 
@@ -239,6 +243,21 @@ const useWebRTC = (roomId) => {
     };
 
     /**
+     * Flush any ICE candidates that were buffered while waiting for the remote
+     * description to be set. Call this immediately after setRemoteDescription resolves.
+     */
+    const flushIceCandidates = useCallback(async (pc, senderSocketId) => {
+        remoteDescReady.current.add(senderSocketId);
+        const buffered = iceCandidateBuffer.current.get(senderSocketId) || [];
+        iceCandidateBuffer.current.delete(senderSocketId);
+        for (const c of buffered) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {
+                console.warn('[Vossle WebRTC] Buffered ICE candidate error:', e.message);
+            }
+        }
+    }, []);
+
+    /**
      * Handle SDP Offer with Collision/Glare Management
      */
     const handleOffer = useCallback(async (offer, senderSocketId, isPolite) => {
@@ -259,6 +278,9 @@ const useWebRTC = (roomId) => {
             console.log('[Vossle WebRTC] Processing offer from', senderSocketId, 'polite:', isPolite);
             await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
+            // Remote description is now set — flush any buffered ICE candidates
+            await flushIceCandidates(pc, senderSocketId);
+
             if (offer.type === 'offer') {
                 await pc.setLocalDescription();
                 socketService.emit('webrtc:answer', {
@@ -270,7 +292,7 @@ const useWebRTC = (roomId) => {
         } catch (err) {
             console.error('[Vossle WebRTC] Offer handling error:', err);
         }
-    }, [createPeerConnection]);
+    }, [createPeerConnection, flushIceCandidates]);
 
     /**
      * Handle SDP Answer
@@ -284,23 +306,36 @@ const useWebRTC = (roomId) => {
         try {
             console.log('[Vossle WebRTC] Processing answer from', senderSocketId);
             await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+            // Remote description is now set — flush any buffered ICE candidates
+            await flushIceCandidates(pc, senderSocketId);
         } catch (err) {
             console.error('[Vossle WebRTC] Answer handling error:', err);
         }
-    }, []);
+    }, [flushIceCandidates]);
 
     /**
      * Handle ICE Candidate
+     * Buffers candidates that arrive before the remote description is set,
+     * to avoid "addIceCandidate called in wrong state" failures.
      */
     const handleIceCandidate = useCallback(async (candidate, senderSocketId) => {
         const pc = peerConnections.current.get(senderSocketId);
-        if (!pc) return;
+
+        // Buffer the candidate if the PC doesn't exist yet or remote description
+        // hasn't been set (setRemoteDescription is still pending or hasn't been called).
+        if (!pc || !remoteDescReady.current.has(senderSocketId)) {
+            if (!iceCandidateBuffer.current.has(senderSocketId)) {
+                iceCandidateBuffer.current.set(senderSocketId, []);
+            }
+            iceCandidateBuffer.current.get(senderSocketId).push(candidate);
+            return;
+        }
+
         try {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
         } catch (err) {
-            if (!ignoreOffer.current) {
-                console.error('[Vossle WebRTC] ICE error:', err);
-            }
+            console.error('[Vossle WebRTC] ICE candidate error:', err);
         }
     }, []);
 
@@ -368,6 +403,8 @@ const useWebRTC = (roomId) => {
         if (screenStream.current) screenStream.current.getTracks().forEach(t => t.stop());
         peerConnections.current.forEach(pc => pc.close());
         peerConnections.current.clear();
+        iceCandidateBuffer.current.clear();
+        remoteDescReady.current.clear();
         if (localStreamRef.current) localStreamRef.current.getTracks().forEach(t => t.stop());
         setLocalStream(null);
         setRemoteStream(null);
@@ -381,6 +418,8 @@ const useWebRTC = (roomId) => {
             if (metricsInterval.current) clearInterval(metricsInterval.current);
             peerConnections.current.forEach(pc => pc.close());
             peerConnections.current.clear();
+            iceCandidateBuffer.current.clear();
+            remoteDescReady.current.clear();
             if (localStreamRef.current) {
                 localStreamRef.current.getTracks().forEach(t => t.stop());
             }

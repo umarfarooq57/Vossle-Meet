@@ -145,7 +145,7 @@ const Room = () => {
             'room:joined', 'room:user-joined', 'webrtc:offer', 'webrtc:answer',
             'webrtc:ice-candidate', 'room:user-left', 'media:video-toggled',
             'media:audio-toggled', 'media:screen-share-changed', 'media:hand-raised',
-            'chat:message', 'room:join-request', 'room:waiting-admission',
+            'reaction', 'chat:message', 'room:join-request', 'room:waiting-admission',
             'room:admitted', 'room:rejected',
         ];
         events.forEach(evt => socket.removeAllListeners(evt));
@@ -220,9 +220,8 @@ const Room = () => {
         socket.on('room:user-left', ({ userName, socketId }) => {
             console.log('[Vossle Room] User left:', userName);
             setRemoteUserName('');
-            setRemoteStream_null();
+            setStatus('connected');
             setParticipants(prev => prev.filter(p => p.id !== socketId));
-            // Don't reset to lobby — stay in connected state, just show "waiting for others"
         });
 
         socket.on('media:video-toggled', ({ enabled, socketId }) => {
@@ -239,6 +238,14 @@ const Room = () => {
 
         socket.on('media:hand-raised', ({ raised, socketId }) => {
             setParticipants(prev => prev.map(p => p.id === socketId ? { ...p, isHandRaised: raised } : p));
+        });
+
+        socket.on('reaction', ({ emoji }) => {
+            if (emoji) {
+                const id = Date.now();
+                setReactions(prev => [...prev, { id, emoji }]);
+                setTimeout(() => setReactions(prev => prev.filter(r => r.id !== id)), 3000);
+            }
         });
 
         socket.on('chat:message', (message) => {
@@ -274,14 +281,6 @@ const Room = () => {
             events.forEach(evt => socket.removeAllListeners(evt));
         };
     }, [createPeerConnection, handleOffer, handleAnswer, handleIceCandidate]);
-
-    // Helper: we can't call setRemoteStream from Room since it's inside the hook
-    // Instead we rely on the hook to clear it. But we need a way to signal "user left"
-    // For now, the remoteStream will go null naturally when the PC closes.
-    const setRemoteStream_null = () => {
-        // The remote stream will be cleaned up by the WebRTC hook when the PC closes
-        // We just update UI state here
-    };
 
     // ── Join meeting (from lobby) ──
     const joinMeeting = useCallback(async () => {
