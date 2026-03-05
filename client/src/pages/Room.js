@@ -184,13 +184,14 @@ const Room = () => {
         });
 
         socket.on('room:user-joined', async ({ socketId, userName }) => {
-            console.log('[Vossle Room] User joined:', userName, socketId);
+            console.log('[Vossle Room] ✅ User joined:', userName, socketId);
+            console.log('[Vossle Room] Current local stream available:', localStream ? 'YES' : 'NO');
             setRemoteUserName(userName);
             setStatus('connecting');
 
             // Existing user
             const isPolite = getIsPolite(socketId);
-            console.log('[Vossle Room] Creating PC for:', socketId, 'isPolite:', isPolite);
+            console.log('[Vossle Room] 🔗 Creating PC for:', socketId, 'isPolite:', isPolite);
             await createPeerConnection(socketId, isPolite);
 
             setParticipants(prev => {
@@ -205,14 +206,16 @@ const Room = () => {
         });
 
         socket.on('webrtc:offer', async ({ offer, senderSocketId, senderName }) => {
-            console.log('[Vossle Room] Received offer from:', senderName, senderSocketId);
+            console.log('[Vossle Room] 📥 Received offer from:', senderName, senderSocketId);
+            console.log('[Vossle Room] Offer SDP type:', offer?.type, 'has sdp:', !!offer?.sdp);
             if (senderName) setRemoteUserName(senderName);
             const isPolite = getIsPolite(senderSocketId);
             await handleOffer(offer, senderSocketId, isPolite);
         });
 
         socket.on('webrtc:answer', async ({ answer, senderSocketId }) => {
-            console.log('[Vossle Room] Received answer from:', senderSocketId);
+            console.log('[Vossle Room] 📥 Received answer from:', senderSocketId);
+            console.log('[Vossle Room] Answer SDP type:', answer?.type, 'has sdp:', !!answer?.sdp);
             await handleAnswer(answer, senderSocketId);
         });
 
@@ -315,11 +318,15 @@ const Room = () => {
 
             // Pre-fetch ICE config so createPeerConnection is instant later
             // (eliminates the race where a remote offer arrives before our PC exists)
+            console.log('[Vossle Room] 📡 Pre-fetching ICE config...');
             await prefetchIceConfig();
+            console.log('[Vossle Room] ✅ ICE config cached');
 
             // Connect socket and WAIT for it to be ready
+            console.log('[Vossle Room] 🔌 Connecting to signaling server...');
             const token = api.getToken();
             await socketService.connect(token);
+            console.log('[Vossle Room] ✅ Socket connected:', socketService.getSocket()?.id);
 
             // Setup handlers FIRST (before joining room)
             if (cleanupSignalingRef.current) {
@@ -328,7 +335,8 @@ const Room = () => {
             cleanupSignalingRef.current = setupSignalingHandlers();
 
             // Join room via socket (socket is guaranteed connected, handlers are registered)
-            console.log('[Vossle Room] Emitting room:join for', sessionId);
+            console.log('[Vossle Room] 🚀 Emitting room:join for sessionId:', sessionId);
+            console.log('[Vossle Room] Local stream tracks:', stream.getTracks().map(t => `${t.kind}:enabled=${t.enabled}`));
             socketService.emit('room:join', { roomId: sessionId, sessionId });
 
             // Add self to participants
@@ -340,7 +348,7 @@ const Room = () => {
             }]);
 
         } catch (err) {
-            console.error('[Vossle Room] Join error:', err);
+            console.error('[Vossle Room] ❌ Join error:', err);
             setError(err.message || 'Failed to join meeting.');
             setStatus('ended');
             hasInitialized.current = false;
