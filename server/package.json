@@ -4,6 +4,8 @@
     "description": "Vossle — WebRTC Video Platform Signaling Server",
     "main": "src/index.js",
     "scripts": {
+        "postinstall": "prisma generate",
+        "build": "prisma generate",
         "start": "node src/index.js",
         "dev": "nodemon src/index.js",
         "test": "jest --coverage"
