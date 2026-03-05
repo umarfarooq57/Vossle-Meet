@@ -3,3 +3,10 @@ node_modules
 .env
 
 /src/generated/prisma
+
+# SQLite (local development)
+dev.db
+dev.db-journal
+prisma/migrations/
+*.db
+*.db-journal
