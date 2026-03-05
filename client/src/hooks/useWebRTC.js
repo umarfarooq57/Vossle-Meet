@@ -158,116 +158,116 @@ const useWebRTC = (roomId) => {
         }
 
         const creationPromise = (async () => {
-        // Close any stale connection
-        const stale = peerConnections.current.get(remoteSocketId);
-        if (stale) {
-            stale.close();
-            peerConnections.current.delete(remoteSocketId);
-        }
-
-        const iceConfig = await getIceConfig();
-        console.log('[Vossle WebRTC] Creating PC with config:', iceConfig.iceServers.length, 'servers, polite:', isPolite);
-        const pc = new RTCPeerConnection(iceConfig);
-
-        // Add local tracks to the connection
-        const stream = localStreamRef.current;
-        if (stream) {
-            stream.getTracks().forEach(track => {
-                console.log('[Vossle WebRTC] Adding track:', track.kind, track.label, 'enabled:', track.enabled, 'readyState:', track.readyState);
-                const sender = pc.addTrack(track, stream);
-                console.log('[Vossle WebRTC] Track added, sender:', sender);
-            });
-        } else {
-            console.warn('[Vossle WebRTC] ⚠️ No local stream when creating PC!');
-        }
-
-        // Handle remote tracks
-        pc.ontrack = ({ streams: [remoteStreamObj], track }) => {
-            console.log('[Vossle WebRTC] ✅ Remote track received:', track.kind, track.label, 'muted:', track.muted, 'enabled:', track.enabled, 'readyState:', track.readyState);
-            console.log('[Vossle WebRTC] Remote stream tracks:', remoteStreamObj.getTracks().map(t => `${t.kind}:${t.readyState}`));
-            setRemoteStream(remoteStreamObj);
-            if (remoteVideoRef.current) {
-                remoteVideoRef.current.srcObject = remoteStreamObj;
-                console.log('[Vossle WebRTC] Remote stream assigned to video element');
+            // Close any stale connection
+            const stale = peerConnections.current.get(remoteSocketId);
+            if (stale) {
+                stale.close();
+                peerConnections.current.delete(remoteSocketId);
             }
 
-            // Ensure the remote video plays
-            track.onunmute = () => {
-                console.log('[Vossle WebRTC] Remote track unmuted:', track.kind);
-                if (remoteVideoRef.current && remoteVideoRef.current.srcObject !== remoteStreamObj) {
+            const iceConfig = await getIceConfig();
+            console.log('[Vossle WebRTC] Creating PC with config:', iceConfig.iceServers.length, 'servers, polite:', isPolite);
+            const pc = new RTCPeerConnection(iceConfig);
+
+            // Add local tracks to the connection
+            const stream = localStreamRef.current;
+            if (stream) {
+                stream.getTracks().forEach(track => {
+                    console.log('[Vossle WebRTC] Adding track:', track.kind, track.label, 'enabled:', track.enabled, 'readyState:', track.readyState);
+                    const sender = pc.addTrack(track, stream);
+                    console.log('[Vossle WebRTC] Track added, sender:', sender);
+                });
+            } else {
+                console.warn('[Vossle WebRTC] ⚠️ No local stream when creating PC!');
+            }
+
+            // Handle remote tracks
+            pc.ontrack = ({ streams: [remoteStreamObj], track }) => {
+                console.log('[Vossle WebRTC] ✅ Remote track received:', track.kind, track.label, 'muted:', track.muted, 'enabled:', track.enabled, 'readyState:', track.readyState);
+                console.log('[Vossle WebRTC] Remote stream tracks:', remoteStreamObj.getTracks().map(t => `${t.kind}:${t.readyState}`));
+                setRemoteStream(remoteStreamObj);
+                if (remoteVideoRef.current) {
                     remoteVideoRef.current.srcObject = remoteStreamObj;
+                    console.log('[Vossle WebRTC] Remote stream assigned to video element');
+                }
+
+                // Ensure the remote video plays
+                track.onunmute = () => {
+                    console.log('[Vossle WebRTC] Remote track unmuted:', track.kind);
+                    if (remoteVideoRef.current && remoteVideoRef.current.srcObject !== remoteStreamObj) {
+                        remoteVideoRef.current.srcObject = remoteStreamObj;
+                    }
+                };
+            };
+
+            // ICE candidates
+            pc.onicecandidate = ({ candidate }) => {
+                if (candidate) {
+                    console.log('[Vossle WebRTC] ICE candidate:', candidate.type, candidate.protocol, candidate.address);
+                    socketService.emit('webrtc:ice-candidate', { candidate, targetSocketId: remoteSocketId });
+                } else {
+                    console.log('[Vossle WebRTC] ICE gathering complete');
                 }
             };
-        };
 
-        // ICE candidates
-        pc.onicecandidate = ({ candidate }) => {
-            if (candidate) {
-                console.log('[Vossle WebRTC] ICE candidate:', candidate.type, candidate.protocol, candidate.address);
-                socketService.emit('webrtc:ice-candidate', { candidate, targetSocketId: remoteSocketId });
-            } else {
-                console.log('[Vossle WebRTC] ICE gathering complete');
-            }
-        };
+            pc.onicecandidateerror = (event) => {
+                // Only warn on non-trivial errors
+                if (event.errorCode !== 701) {
+                    console.warn('[Vossle WebRTC] ICE candidate error:', event.errorCode, event.errorText);
+                }
+            };
 
-        pc.onicecandidateerror = (event) => {
-            // Only warn on non-trivial errors
-            if (event.errorCode !== 701) {
-                console.warn('[Vossle WebRTC] ICE candidate error:', event.errorCode, event.errorText);
-            }
-        };
+            pc.oniceconnectionstatechange = () => {
+                console.log(`[Vossle WebRTC] 🔗 ICE state (${remoteSocketId}): ${pc.iceConnectionState}`);
+                if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                    console.log('[Vossle WebRTC] ✅ ICE connection established!');
+                } else if (pc.iceConnectionState === 'failed') {
+                    console.error('[Vossle WebRTC] ❌ ICE failed, attempting restart...');
+                    pc.restartIce();
+                } else if (pc.iceConnectionState === 'disconnected') {
+                    console.warn('[Vossle WebRTC] ⚠️ ICE disconnected');
+                }
+            };
 
-        pc.oniceconnectionstatechange = () => {
-            console.log(`[Vossle WebRTC] 🔗 ICE state (${remoteSocketId}): ${pc.iceConnectionState}`);
-            if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-                console.log('[Vossle WebRTC] ✅ ICE connection established!');
-            } else if (pc.iceConnectionState === 'failed') {
-                console.error('[Vossle WebRTC] ❌ ICE failed, attempting restart...');
-                pc.restartIce();
-            } else if (pc.iceConnectionState === 'disconnected') {
-                console.warn('[Vossle WebRTC] ⚠️ ICE disconnected');
-            }
-        };
+            pc.onconnectionstatechange = () => {
+                const state = pc.connectionState;
+                console.log(`[Vossle WebRTC] 🌐 Connection state (${remoteSocketId}): ${state}`);
+                setConnectionState(state);
 
-        pc.onconnectionstatechange = () => {
-            const state = pc.connectionState;
-            console.log(`[Vossle WebRTC] 🌐 Connection state (${remoteSocketId}): ${state}`);
-            setConnectionState(state);
-            
-            if (state === 'connected') {
-                console.log('[Vossle WebRTC] ✅ Peer connection established successfully!');
-                const senders = pc.getSenders();
-                console.log('[Vossle WebRTC] Active senders:', senders.map(s => s.track ? `${s.track.kind}:${s.track.readyState}:enabled=${s.track.enabled}` : 'null'));
-            } else if (state === 'failed') {
-                console.error('[Vossle WebRTC] ❌ Peer connection failed!');
-            }
-        };
+                if (state === 'connected') {
+                    console.log('[Vossle WebRTC] ✅ Peer connection established successfully!');
+                    const senders = pc.getSenders();
+                    console.log('[Vossle WebRTC] Active senders:', senders.map(s => s.track ? `${s.track.kind}:${s.track.readyState}:enabled=${s.track.enabled}` : 'null'));
+                } else if (state === 'failed') {
+                    console.error('[Vossle WebRTC] ❌ Peer connection failed!');
+                }
+            };
 
-        // ── Perfect Negotiation: NegotiationNeeded ──
-        pc.onnegotiationneeded = async () => {
-            try {
-                makingOffer.current = true;
-                console.log('[Vossle WebRTC] 📡 Negotiation needed, creating offer...');
-                console.log('[Vossle WebRTC] Current connection state:', pc.connectionState, 'signaling:', pc.signalingState);
-                await pc.setLocalDescription();
-                console.log('[Vossle WebRTC] 📤 Sending offer to', remoteSocketId, 'tracks:', pc.getSenders().length);
-                socketService.emit('webrtc:offer', {
-                    offer: pc.localDescription,
-                    targetSocketId: remoteSocketId,
-                });
-            } catch (err) {
-                console.error('[Vossle WebRTC] ❌ Negotiation error:', err);
-            } finally {
-                makingOffer.current = false;
-            }
-        };
+            // ── Perfect Negotiation: NegotiationNeeded ──
+            pc.onnegotiationneeded = async () => {
+                try {
+                    makingOffer.current = true;
+                    console.log('[Vossle WebRTC] 📡 Negotiation needed, creating offer...');
+                    console.log('[Vossle WebRTC] Current connection state:', pc.connectionState, 'signaling:', pc.signalingState);
+                    await pc.setLocalDescription();
+                    console.log('[Vossle WebRTC] 📤 Sending offer to', remoteSocketId, 'tracks:', pc.getSenders().length);
+                    socketService.emit('webrtc:offer', {
+                        offer: pc.localDescription,
+                        targetSocketId: remoteSocketId,
+                    });
+                } catch (err) {
+                    console.error('[Vossle WebRTC] ❌ Negotiation error:', err);
+                } finally {
+                    makingOffer.current = false;
+                }
+            };
 
-        peerConnections.current.set(remoteSocketId, pc);
+            peerConnections.current.set(remoteSocketId, pc);
 
-        // Start quality metrics collection
-        startQualityMetrics(pc);
+            // Start quality metrics collection
+            startQualityMetrics(pc);
 
-        return pc;
+            return pc;
         })();
 
         pcCreationLocks.current.set(remoteSocketId, creationPromise);
@@ -319,7 +319,7 @@ const useWebRTC = (roomId) => {
      */
     const handleOffer = useCallback(async (offer, senderSocketId, isPolite) => {
         console.log('[Vossle WebRTC] 📥 Received offer from', senderSocketId, 'polite:', isPolite, 'current local stream:', localStreamRef.current ? 'YES' : 'NO');
-        
+
         let pc = peerConnections.current.get(senderSocketId);
         if (!pc || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
             console.log('[Vossle WebRTC] Creating new PC for offer from', senderSocketId);
