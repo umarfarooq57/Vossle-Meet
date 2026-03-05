@@ -124,6 +124,14 @@ const Room = () => {
         };
     }, [sessionId]);
 
+    // ── Deterministic Role Assignment ──
+    const getIsPolite = useCallback((remoteId) => {
+        const localId = socketService.getSocket()?.id;
+        if (!localId || !remoteId) return true;
+        // String comparison ensures one is polite, the other is impolite
+        return String(localId) > String(remoteId);
+    }, []);
+
     // ── Signaling handlers — uses refs to avoid stale closures ──
     const setupSignalingHandlers = useCallback(() => {
         const socket = socketService.getSocket();
@@ -151,9 +159,10 @@ const Room = () => {
                 setRemoteUserName(peer.userName);
                 setStatus('connecting');
 
-                // Newcomer is POLITE (waits for offer from existing user)
-                console.log('[Vossle Room] Creating PC as polite peer for:', peer.socketId);
-                await createPeerConnection(peer.socketId, true);
+                // Newcomer
+                const isPolite = getIsPolite(peer.socketId);
+                console.log('[Vossle Room] Creating PC for:', peer.socketId, 'isPolite:', isPolite);
+                await createPeerConnection(peer.socketId, isPolite);
 
                 setParticipants(prev => {
                     const others = prev.filter(p => p.id !== peer.socketId);
@@ -176,9 +185,10 @@ const Room = () => {
             setRemoteUserName(userName);
             setStatus('connecting');
 
-            // Existing user is IMPOLITE (creates offer)
-            console.log('[Vossle Room] Creating PC as impolite peer for:', socketId);
-            await createPeerConnection(socketId, false);
+            // Existing user
+            const isPolite = getIsPolite(socketId);
+            console.log('[Vossle Room] Creating PC for:', socketId, 'isPolite:', isPolite);
+            await createPeerConnection(socketId, isPolite);
 
             setParticipants(prev => {
                 const others = prev.filter(p => p.id !== socketId);
@@ -194,9 +204,8 @@ const Room = () => {
         socket.on('webrtc:offer', async ({ offer, senderSocketId, senderName }) => {
             console.log('[Vossle Room] Received offer from:', senderName, senderSocketId);
             if (senderName) setRemoteUserName(senderName);
-            // Newcomer is polite, existing user is impolite
-            // If we receive an offer, we should be polite (accept it)
-            await handleOffer(offer, senderSocketId, true);
+            const isPolite = getIsPolite(senderSocketId);
+            await handleOffer(offer, senderSocketId, isPolite);
         });
 
         socket.on('webrtc:answer', async ({ answer, senderSocketId }) => {
